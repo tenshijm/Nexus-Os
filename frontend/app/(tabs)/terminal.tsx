@@ -32,17 +32,35 @@ export default function TerminalScreen() {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx] = useState<number>(-1);
+  const [source, setSource] = useState<"sim" | "ssh">("sim");
+  const [hostLabel, setHostLabel] = useState<string>("nexus@raspberry-tenshi");
   const scrollRef = useRef<ScrollView>(null);
   const inputRef = useRef<TextInput>(null);
+
+  useEffect(() => {
+    // Probe SSH on mount so the badge reflects reality.
+    api.sshTest().then((r) => {
+      if (r?.configured && r?.ok) {
+        setSource("ssh");
+        setHostLabel(r.host || "ssh");
+        setLines((l) => [
+          ...l,
+          { kind: "out", text: `[ssh] connected to ${r.host}` },
+        ]);
+      }
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
   }, [lines]);
 
+  const promptText = `${hostLabel}:~$ `;
+
   const exec = async () => {
     const cmd = input.trim();
     if (!cmd) return;
-    setLines((l) => [...l, { kind: "in", text: PROMPT + cmd }]);
+    setLines((l) => [...l, { kind: "in", text: promptText + cmd }]);
     setHistory((h) => [...h, cmd]);
     setHistIdx(-1);
     setInput("");
@@ -57,9 +75,14 @@ export default function TerminalScreen() {
         setLines([]);
         return;
       }
+      setSource(res.source || source);
+      if (res.host) setHostLabel(res.host);
       out.split("\n").forEach((line) => {
         setLines((l) => [...l, { kind: "out", text: line }]);
       });
+      if (typeof res.exit_code === "number" && res.exit_code !== 0) {
+        setLines((l) => [...l, { kind: "out", text: `[exit ${res.exit_code}]` }]);
+      }
     } catch {
       setLines((l) => [...l, { kind: "out", text: "error: link down" }]);
     }
@@ -87,6 +110,17 @@ export default function TerminalScreen() {
       style={{ flex: 1, backgroundColor: "#000" }}
     >
       <View style={{ flex: 1, backgroundColor: "#000" }} testID="terminal-screen">
+        <View style={styles.sourceBar}>
+          <View
+            style={[
+              styles.sourceDot,
+              { backgroundColor: source === "ssh" ? COLORS.green : COLORS.amber },
+            ]}
+          />
+          <Text style={styles.sourceLabel}>
+            {source === "ssh" ? `LIVE SSH · ${hostLabel}` : "SIMULATED SHELL · configure SSH in CONFIG"}
+          </Text>
+        </View>
         <ScrollView
           ref={scrollRef}
           style={styles.scroll}
@@ -105,7 +139,7 @@ export default function TerminalScreen() {
             </Text>
           ))}
           <View style={styles.activeRow}>
-            <Text style={[styles.line, { color: COLORS.green }]}>{PROMPT}</Text>
+            <Text style={[styles.line, { color: COLORS.green }]}>{promptText}</Text>
             <Text style={[styles.line, { color: COLORS.green }]}>{input}</Text>
             <BlinkingCursor />
           </View>
@@ -139,7 +173,7 @@ export default function TerminalScreen() {
         </View>
 
         <View style={styles.inputRow}>
-          <Text style={styles.prompt}>{PROMPT}</Text>
+          <Text style={styles.prompt}>{promptText}</Text>
           <TextInput
             ref={inputRef}
             value={input}
@@ -165,6 +199,24 @@ export default function TerminalScreen() {
 
 const styles = StyleSheet.create({
   scroll: { flex: 1 },
+  sourceBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderColor: COLORS.greenBorder,
+    backgroundColor: COLORS.card,
+  },
+  sourceDot: { width: 8, height: 8, borderRadius: 4 },
+  sourceLabel: {
+    fontFamily: FONTS.mono,
+    color: COLORS.textMuted,
+    fontSize: 10,
+    letterSpacing: 1.5,
+    flex: 1,
+  },
   line: {
     fontFamily: FONTS.mono,
     fontSize: 12,

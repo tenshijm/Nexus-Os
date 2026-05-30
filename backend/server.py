@@ -47,6 +47,10 @@ DEFAULT_SETTINGS = {
     "ollama_url": os.environ.get("OLLAMA_URL", "http://localhost:11434"),
     "pi_ip": os.environ.get("PI_IP", "192.168.12.177"),
     "hostname": os.environ.get("PI_HOSTNAME", "RASPBERRY-TENSHI"),
+    "ssh_host": os.environ.get("SSH_HOST", "192.168.12.177"),
+    "ssh_port": int(os.environ.get("SSH_PORT", "22")),
+    "ssh_user": os.environ.get("SSH_USER", "nexus"),
+    "ssh_password": os.environ.get("SSH_PASSWORD", ""),
 }
 
 BOOT_TIME = time.time()
@@ -111,6 +115,10 @@ class SettingsUpdate(BaseModel):
     ollama_url: Optional[str] = None
     pi_ip: Optional[str] = None
     hostname: Optional[str] = None
+    ssh_host: Optional[str] = None
+    ssh_port: Optional[int] = None
+    ssh_user: Optional[str] = None
+    ssh_password: Optional[str] = None
 
 
 AUDIO_STATE: dict[str, Any] = {
@@ -142,11 +150,13 @@ async def save_settings(update: dict) -> dict:
 
 
 def public_settings(s: dict) -> dict:
-    """Mask the token when returning to clients."""
+    """Mask sensitive values when returning to clients."""
     out = dict(s)
     tok = out.pop("ha_token", "") or ""
     out["ha_token_set"] = bool(tok)
     out["ha_token_masked"] = (f"{tok[:6]}…{tok[-4:]}" if len(tok) > 10 else ("***" if tok else ""))
+    pw = out.pop("ssh_password", "") or ""
+    out["ssh_password_set"] = bool(pw)
     return out
 
 
@@ -664,9 +674,85 @@ async def logs_clear():
 # ----------------------------- Terminal -----------------------------
 @api_router.post("/terminal/exec")
 async def terminal_exec(req: TerminalCommandRequest):
+    """Run a command. If SSH is configured (ssh_host + ssh_user + ssh_password),
+    execute it on the real Pi via paramiko. Otherwise fall back to the simulated
+    shell so the UI is always usable."""
     cmd = (req.command or "").strip()
+    s = await get_settings()
+    use_ssh = bool(s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"))
+    if use_ssh and cmd not in ("clear", "help", "?"):
+        try:
+            out, exit_code = await asyncio.to_thread(_ssh_run, s, cmd)
+            return {
+                "command": cmd,
+                "output": out,
+                "exit_code": exit_code,
+                "source": "ssh",
+                "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception as e:
+            return {
+                "command": cmd,
+                "output": f"[ssh error] {e}",
+                "exit_code": -1,
+                "source": "ssh",
+                "host": f"{s.get('ssh_user','?')}@{s.get('ssh_host','?')}",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
     out = _simulate_shell(cmd)
-    return {"command": cmd, "output": out, "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "command": cmd,
+        "output": out,
+        "exit_code": 0,
+        "source": "sim",
+        "host": "nexus@raspberry-tenshi",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _ssh_run(s: dict, cmd: str, timeout: float = 12.0) -> tuple[str, int]:
+    import paramiko
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(
+        hostname=s["ssh_host"],
+        port=int(s.get("ssh_port") or 22),
+        username=s["ssh_user"],
+        password=s.get("ssh_password") or None,
+        timeout=6.0,
+        banner_timeout=6.0,
+        auth_timeout=6.0,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    try:
+        stdin, stdout, stderr = cli.exec_command(cmd, timeout=timeout, get_pty=False)
+        exit_code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        text = (out + (("\n" + err) if err else "")).rstrip()
+        return text or "(no output)", exit_code
+    finally:
+        cli.close()
+
+
+@api_router.post("/terminal/ssh-test")
+async def terminal_ssh_test():
+    s = await get_settings()
+    if not (s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password")):
+        return {"ok": False, "configured": False, "error": "ssh credentials not set"}
+    try:
+        out, code = await asyncio.to_thread(_ssh_run, s, "echo NEXUS_SSH_OK && hostname && uname -srm", timeout=8.0)
+        return {
+            "ok": code == 0 and "NEXUS_SSH_OK" in out,
+            "configured": True,
+            "exit_code": code,
+            "output": out,
+            "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
+        }
+    except Exception as e:
+        return {"ok": False, "configured": True, "error": str(e)}
 
 
 def _simulate_shell(cmd: str) -> str:

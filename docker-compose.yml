@@ -1,0 +1,54 @@
+version: "3.9"
+
+# NEXUS OS — backend stack for the Raspberry Pi
+# -----------------------------------------------------------------------------
+# Run on RASPBERRY-TENSHI (192.168.12.177):
+#   docker compose up -d --build
+# The Expo mobile app should then point its EXPO_PUBLIC_BACKEND_URL at
+#   http://192.168.12.177:8001
+# -----------------------------------------------------------------------------
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: nexus-mongo
+    restart: unless-stopped
+    volumes:
+      - nexus-mongo-data:/data/db
+    expose:
+      - "27017"
+    networks: [nexus-net]
+
+  nexus-api:
+    build: ./backend
+    container_name: nexus-api
+    restart: unless-stopped
+    depends_on: [mongo]
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: nexus
+      EMERGENT_LLM_KEY: ${EMERGENT_LLM_KEY:-}
+      HA_URL: ${HA_URL:-http://192.168.12.177:8123}
+      HA_TOKEN: ${HA_TOKEN:-}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      PI_IP: ${PI_IP:-192.168.12.177}
+      PI_HOSTNAME: ${PI_HOSTNAME:-RASPBERRY-TENSHI}
+      SSH_HOST: ${SSH_HOST:-192.168.12.177}
+      SSH_PORT: ${SSH_PORT:-22}
+      SSH_USER: ${SSH_USER:-pi}
+      SSH_PASSWORD: ${SSH_PASSWORD:-}
+    ports:
+      - "8001:8001"
+    volumes:
+      # Mount Docker socket so the API can list/start/stop containers on the Pi
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [nexus-net]
+
+volumes:
+  nexus-mongo-data:
+
+networks:
+  nexus-net:
+    driver: bridge

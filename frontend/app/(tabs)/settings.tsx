@@ -12,6 +12,10 @@ type Form = {
   ollama_url: string;
   pi_ip: string;
   hostname: string;
+  ssh_host: string;
+  ssh_port: string;
+  ssh_user: string;
+  ssh_password: string;
 };
 
 const EMPTY: Form = {
@@ -20,6 +24,10 @@ const EMPTY: Form = {
   ollama_url: "",
   pi_ip: "",
   hostname: "",
+  ssh_host: "",
+  ssh_port: "22",
+  ssh_user: "",
+  ssh_password: "",
 };
 
 const CACHE_KEY = "nexus.settings.cache";
@@ -45,6 +53,9 @@ export default function SettingsScreen() {
   const [tokenSet, setTokenSet] = useState(false);
   const [tokenDirty, setTokenDirty] = useState(false);
   const [showToken, setShowToken] = useState(false);
+  const [sshSet, setSshSet] = useState(false);
+  const [sshDirty, setSshDirty] = useState(false);
+  const [showSsh, setShowSsh] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -74,10 +85,16 @@ export default function SettingsScreen() {
         ollama_url: s.ollama_url || "",
         pi_ip: s.pi_ip || "",
         hostname: s.hostname || "",
+        ssh_host: s.ssh_host || "",
+        ssh_port: String(s.ssh_port ?? 22),
+        ssh_user: s.ssh_user || "",
+        ssh_password: "",
       });
       setMaskedToken(s.ha_token_masked || "");
       setTokenSet(!!s.ha_token_set);
       setTokenDirty(false);
+      setSshSet(!!s.ssh_password_set);
+      setSshDirty(false);
       await storage.setItem(
         CACHE_KEY,
         JSON.stringify({
@@ -278,6 +295,111 @@ export default function SettingsScreen() {
             />
           </Card>
 
+          <Card style={{ marginTop: 12 }}>
+            <View style={styles.row}>
+              <SectionLabel color={COLORS.red}>SSH SHELL (REAL TERMINAL)</SectionLabel>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <StatusDot color={sshSet ? COLORS.green : COLORS.red} />
+                <Mono size={9} color={COLORS.textMuted}>
+                  {sshSet ? "ACTIVE" : "DISABLED"}
+                </Mono>
+              </View>
+            </View>
+            <Mono color={COLORS.textMuted} size={10} style={{ marginTop: 4 }}>
+              // when set, the TERM tab executes commands on the Pi via paramiko
+            </Mono>
+            <Field
+              label="SSH Host"
+              value={form.ssh_host}
+              onChange={(v) => setForm({ ...form, ssh_host: v })}
+              placeholder="192.168.12.177"
+              testID="cfg-ssh-host"
+            />
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <View style={{ flex: 2 }}>
+                <Field
+                  label="SSH User"
+                  value={form.ssh_user}
+                  onChange={(v) => setForm({ ...form, ssh_user: v })}
+                  placeholder="pi"
+                  testID="cfg-ssh-user"
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Field
+                  label="Port"
+                  value={form.ssh_port}
+                  onChange={(v) => setForm({ ...form, ssh_port: v })}
+                  placeholder="22"
+                  testID="cfg-ssh-port"
+                  keyboardType="number-pad"
+                />
+              </View>
+            </View>
+            <View style={{ marginTop: 10 }}>
+              <SectionLabel color={COLORS.textMuted}>SSH Password</SectionLabel>
+              {!sshDirty && sshSet && (
+                <View style={styles.inputWrap}>
+                  <Mono color={COLORS.textMuted}>•••••••••• (saved)</Mono>
+                </View>
+              )}
+              {(sshDirty || !sshSet) && (
+                <View style={[styles.inputWrap, { flexDirection: "row", alignItems: "center" }]}>
+                  <TextInput
+                    value={form.ssh_password}
+                    onChangeText={(v) => {
+                      setForm({ ...form, ssh_password: v });
+                      setSshDirty(true);
+                    }}
+                    placeholder="password"
+                    placeholderTextColor={COLORS.textMuted}
+                    style={[styles.input, { flex: 1 }]}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    secureTextEntry={!showSsh}
+                    testID="cfg-ssh-password"
+                  />
+                  <Pressable
+                    onPress={() => setShowSsh((v) => !v)}
+                    style={{ paddingHorizontal: 4 }}
+                    testID="cfg-ssh-password-show"
+                  >
+                    <Ionicons
+                      name={showSsh ? "eye-off-outline" : "eye-outline"}
+                      size={18}
+                      color={COLORS.green}
+                    />
+                  </Pressable>
+                </View>
+              )}
+              <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
+                {!sshDirty && sshSet && (
+                  <TacButton
+                    label="REPLACE PASSWORD"
+                    variant="warn"
+                    onPress={() => {
+                      setSshDirty(true);
+                      setForm({ ...form, ssh_password: "" });
+                    }}
+                    testID="cfg-replace-ssh"
+                    style={{ flex: 1 }}
+                  />
+                )}
+                {sshDirty && sshSet && (
+                  <TacButton
+                    label="KEEP CURRENT"
+                    variant="outline"
+                    onPress={() => {
+                      setSshDirty(false);
+                      setForm({ ...form, ssh_password: "" });
+                    }}
+                    style={{ flex: 1 }}
+                  />
+                )}
+              </View>
+            </View>
+          </Card>
+
           <View style={{ flexDirection: "row", gap: 10, marginTop: 16 }}>
             <TacButton
               label={saving ? "SAVING…" : "SAVE CONFIG"}
@@ -309,6 +431,7 @@ export default function SettingsScreen() {
                 <ProbeRow label="HOME ASSISTANT" result={probe.ha} />
                 <ProbeRow label="OLLAMA" result={probe.ollama} />
                 <ProbeRow label="DOCKER SOCKET" result={probe.docker} />
+                <ProbeRow label="SSH SHELL" result={probe.ssh} />
               </View>
             ) : (
               <Mono color={COLORS.textMuted} size={10} style={{ marginTop: 8 }}>

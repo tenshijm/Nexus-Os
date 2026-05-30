@@ -1,0 +1,55 @@
+{
+  "summary": "Iteration 3 verified the new SSH integration end-to-end (no real Pi reachable, so we tested graceful degradation). Backend: 9/10 pytest passed against the public preview URL (/app/backend/tests/test_iteration3_ssh.py). GET /api/settings exposes ssh_host/ssh_port (int)/ssh_user/ssh_password_set (bool) and correctly OMITS the raw ssh_password. POST /api/settings with {ssh_user:'pi', ssh_host:'10.0.0.1', ssh_port:2222} updates non-secret SSH fields and subsequent GET reflects them. POST /api/settings with {ssh_password:'secret123'} flips ssh_password_set to true on the next GET and the raw password is NEVER echoed back. POST /api/terminal/ssh-test with no creds returns {ok:false, configured:false, error:'ssh credentials not set'}; with a bogus password it returns {ok:false, configured:true, error:<paramiko/socket error>} without crashing — i.e. paramiko is actually invoked. POST /api/terminal/exec with no creds returns 200 source='sim' exit_code=0 host='nexus@raspberry-tenshi' and 'load average' in the output for command 'uptime'. POST /api/terminal/exec WITH credentials set returns source='ssh' (non-zero exit_code as expected since the Pi is unreachable) — confirming the SSH branch is exercised. /api/ollama/chat (Claude Sonnet 4.5) still works after iteration 3. **One real backend issue:** /api/settings/test currently returns only 3 keys (ha, ollama, docker) — the spec for iteration 3 requires a 4th 'ssh' key (ssh.ok=false in this env). The frontend already renders a ProbeRow for SSH but receives undefined from the API, so the row falls back to 'HTTP FAIL'. Frontend (Playwright, 390x844): boot-screen renders, ENTER NEXUS navigates to dashboard, tab-settings → settings-screen OK, all new SSH testIDs (cfg-ssh-host, cfg-ssh-user, cfg-ssh-port, cfg-ssh-password, cfg-ssh-password-show) are present and visible, SSH SHELL section shows a red DISABLED dot as expected, cfg-save / cfg-reload / cfg-probe all wired. TERM tab (terminal-screen) shows the source bar reading 'SIMULATED SHELL · configure SSH in CONFIG' with prompt 'nexus@raspberry-tenshi:~$'; running 'uptime' returns sim output containing 'load average'. Cleanup: ssh_password cleared, ssh_user/host/port restored to nexus/192.168.12.177/22 — ssh_password_set is false at exit so the SSH SHELL probe stays disabled for the next agent.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "GET /api/settings/test",
+        "issue": "Spec says this endpoint should return 4 keys (ha, ollama, docker, ssh) after iteration 3, but only 3 are returned. Need to add an SSH probe (attempt paramiko connect, return {ok:false, configured:<bool>, error:<str>} when unreachable). The frontend already renders the SSH row (settings.tsx line 434) but receives undefined and shows fallback text. Reference: /app/backend/server.py lines ~558-589 (settings_test handler)."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "CONFIG → LIVE CONNECTIVITY PROBE",
+        "issue": "SSH SHELL row renders but the API response has no 'ssh' field, so result?.ok is undefined and the row shows 'HTTP FAIL' instead of a real SSH probe result. Fix the backend (see backend_issues.minor).",
+        "affected_testIDs": ["cfg-probe"]
+      }
+    ],
+    "design_issues": [],
+    "react_native_issues": [
+      {
+        "component": "RN Web style prop deprecations",
+        "issue": "Console still shows 'textShadow*' / 'shadow*' deprecation warnings on web (from iteration 1/2). Cosmetic only. Reference: /app/frontend/src/theme.ts and Tac components."
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration3_ssh.py",
+    "/app/test_reports/pytest/iteration3_results.xml"
+  ],
+  "action_items": [
+    "Backend: extend /api/settings/test to also probe SSH and include an 'ssh' key in the response so the frontend ProbeRow for SSH renders correctly. Use the same paramiko call as /api/terminal/ssh-test with a short timeout.",
+    "(Cosmetic, carryover) Migrate textShadow*/shadow* style props on RN Web."
+  ],
+  "critical_code_review_comments": [
+    "settings model correctly stores ssh_password write-only — GET /api/settings never returns the raw value, only ssh_password_set:bool. Good.",
+    "/api/terminal/exec correctly branches: when ssh_password_set+host+user → paramiko path with source='ssh'; otherwise simulated shell with source='sim'. Both return the same shape {output, exit_code, source, host, timestamp}.",
+    "/api/terminal/ssh-test cleanly differentiates 'not configured' (configured:false, no connection attempt) from 'configured but failed' (configured:true with paramiko error). Verified by toggling ssh_password during the run.",
+    "Frontend settings.tsx uses sshDirty / sshSet flags so the password field hides behind '•••••••••• (saved)' once persisted, matching the HA-token UX. testIDs cfg-ssh-* are all present.",
+    "Frontend terminal.tsx pings /api/terminal/ssh-test on mount and updates the source bar to LIVE SSH when configured+ok — the SIMULATED SHELL fallback message is correct.",
+    "Bug: /api/settings/test does NOT probe SSH, but the frontend already expects it. This is the only deviation from the iteration 3 spec."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration3_ssh.py (new)",
+    "/app/test_reports/pytest/iteration3_results.xml (new)"
+  ],
+  "success_rate": {"backend": "90%", "frontend": "100%"},
+  "seed_data_creation": "During the run we temporarily set ssh_user='pi', ssh_host='10.0.0.1', ssh_port=2222 and ssh_password='secret123'/'bogus' to exercise both branches of /api/terminal/ssh-test and /api/terminal/exec. The final cleanup test posts {ssh_password:'', ssh_user:'nexus', ssh_host:'192.168.12.177', ssh_port:22} so the system returns to its seeded state. Verified: ssh_password_set=false at exit.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Iteration-3 backend suite lives at /app/backend/tests/test_iteration3_ssh.py and uses EXPO_PUBLIC_BACKEND_URL from frontend/.env. The ONLY failing test is test_settings_test_includes_ssh — once /api/settings/test gains an 'ssh' probe it should return ssh.ok=false in this preview (Pi unreachable). All other iteration-3 endpoints pass. The settings collection's ssh_password is cleared at end of suite so any downstream probe stays in 'configured:false' state. Iteration 1 & 2 suites still pass (no regressions detected in /api/settings GET/POST, /api/ollama/chat, /api/system, etc.).",
+  "rca_of_issue": "Implementation gap in /api/settings/test: the iteration 3 spec requires it to also probe SSH (4th key alongside ha/ollama/docker), but the current handler still only tests the 3 original integrations. The probe should attempt a short paramiko connect using the persisted ssh_host/port/user/password (or return {ok:false, configured:false} when password is empty), mirroring /api/terminal/ssh-test. Mitigation: add an 'ssh' branch to the settings_test handler reusing the same connect-and-close logic with a 3-5 second timeout."
+}

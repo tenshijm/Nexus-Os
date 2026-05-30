@@ -42,4 +42,5 @@ export const api = {
   logsClear: () => req<any>("/logs/clear", { method: "POST" }),
   exec: (command: string) =>
     req<any>("/terminal/exec", { method: "POST", body: JSON.stringify({ command }) }),
+  sshTest: () => req<any>("/terminal/ssh-test", { method: "POST" }),
 };

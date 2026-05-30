@@ -1,13 +1,20 @@
 import React, { useEffect, useRef, useState } from "react";
-import { View, Text, StyleSheet, ScrollView, TextInput, KeyboardAvoidingView, Platform, Pressable } from "react-native";
+import {
+  View,
+  Text,
+  StyleSheet,
+  ScrollView,
+  TextInput,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+} from "react-native";
 import { Mono } from "@/src/components/Tac";
 import { BlinkingCursor } from "@/src/components/Anim";
 import { COLORS, FONTS } from "@/src/theme";
-import { api } from "@/src/api";
+import { useTerminalWs } from "@/src/hooks/use-terminal-ws";
 
 type Line = { kind: "in" | "out"; text: string };
-
-const PROMPT = "nexus@raspberry-tenshi:~$ ";
 
 const SUGGESTIONS = [
   "help",
@@ -24,7 +31,22 @@ const SUGGESTIONS = [
   "date",
 ];
 
+function statusDotColor(status: string, source: "sim" | "ssh"): string {
+  if (status === "open") return source === "ssh" ? COLORS.green : COLORS.amber;
+  if (status === "connecting") return COLORS.amber;
+  return COLORS.red;
+}
+
+function statusLabel(status: string, source: "sim" | "ssh", hostLabel: string, loading: boolean): string {
+  if (loading) return "EXECUTING…";
+  if (status === "connecting") return "WS CONNECTING…";
+  if (status === "closed" || status === "error") return "WS OFFLINE · RECONNECTING…";
+  if (source === "ssh") return `WS LIVE · SSH · ${hostLabel}`;
+  return "WS LIVE · SIM SHELL · configure SSH in CONFIG";
+}
+
 export default function TerminalScreen() {
+  const { status, source, hostLabel, exec } = useTerminalWs();
   const [lines, setLines] = useState<Line[]>([
     { kind: "out", text: "NEXUS-SHELL v1.0.0" },
     { kind: "out", text: "Type 'help' for available commands." },
@@ -32,25 +54,19 @@ export default function TerminalScreen() {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx] = useState<number>(-1);
-  const [source, setSource] = useState<"sim" | "ssh">("sim");
   const [loading, setLoading] = useState(false);
-  const [hostLabel, setHostLabel] = useState<string>("nexus@raspberry-tenshi");
   const scrollRef = useRef<ScrollView>(null);
   const inputRef = useRef<TextInput>(null);
+  const greetedRef = useRef(false);
 
   useEffect(() => {
-    // Probe SSH on mount so the badge reflects reality.
-    api.sshTest().then((r) => {
-      if (r?.configured && r?.ok) {
-        setSource("ssh");
-        setHostLabel(r.host || "ssh");
-        setLines((l) => [
-          ...l,
-          { kind: "out", text: `[ssh] connected to ${r.host}` },
-        ]);
-      }
-    }).catch(() => {});
-  }, []);
+    if (status !== "open" || greetedRef.current) return;
+    greetedRef.current = true;
+    setLines((l) => [
+      ...l,
+      { kind: "out", text: `[ws] channel open · ${source === "ssh" ? hostLabel : "simulated"}` },
+    ]);
+  }, [status, source, hostLabel]);
 
   useEffect(() => {
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
@@ -58,7 +74,7 @@ export default function TerminalScreen() {
 
   const promptText = `${hostLabel}:~$ `;
 
-  const exec = async () => {
+  const runCommand = async () => {
     const cmd = input.trim();
     if (!cmd || loading) return;
     setLines((l) => [...l, { kind: "in", text: promptText + cmd }]);
@@ -69,17 +85,19 @@ export default function TerminalScreen() {
       setLines([]);
       return;
     }
+    if (status !== "open") {
+      setLines((l) => [...l, { kind: "out", text: "error: websocket not connected" }]);
+      return;
+    }
     setLoading(true);
     const t0 = Date.now();
     try {
-      const res = await api.exec(cmd);
+      const res = await exec(cmd);
       const out = res.output as string;
       if (out === "__CLEAR__") {
         setLines([]);
         return;
       }
-      setSource(res.source || source);
-      if (res.host) setHostLabel(res.host);
       const outLines: Line[] = out.split("\n").map((text) => ({ kind: "out", text }));
       if (typeof res.exit_code === "number" && res.exit_code !== 0) {
         outLines.push({ kind: "out", text: `[exit ${res.exit_code}]` });
@@ -88,9 +106,10 @@ export default function TerminalScreen() {
       const serverMs = typeof res.timing_ms === "number" ? res.timing_ms : null;
       outLines.push({
         kind: "out",
-        text: serverMs != null
-          ? `[${elapsed}ms round-trip · ${serverMs}ms server]`
-          : `[${elapsed}ms round-trip]`,
+        text:
+          serverMs != null
+            ? `[${elapsed}ms ws · ${serverMs}ms server]`
+            : `[${elapsed}ms ws]`,
       });
       setLines((l) => [...l, ...outLines]);
     } catch {
@@ -126,15 +145,11 @@ export default function TerminalScreen() {
           <View
             style={[
               styles.sourceDot,
-              { backgroundColor: source === "ssh" ? COLORS.green : COLORS.amber },
+              { backgroundColor: statusDotColor(status, source) },
             ]}
           />
           <Text style={styles.sourceLabel}>
-            {loading
-              ? "EXECUTING…"
-              : source === "ssh"
-                ? `LIVE SSH · ${hostLabel}`
-                : "SIMULATED SHELL · configure SSH in CONFIG"}
+            {statusLabel(status, source, hostLabel, loading)}
           </Text>
         </View>
         <ScrollView
@@ -194,7 +209,7 @@ export default function TerminalScreen() {
             ref={inputRef}
             value={input}
             onChangeText={setInput}
-            onSubmitEditing={exec}
+            onSubmitEditing={runCommand}
             placeholder="enter command..."
             placeholderTextColor={COLORS.textMuted}
             style={styles.input}
@@ -203,11 +218,12 @@ export default function TerminalScreen() {
             autoCorrect={false}
             testID="terminal-input"
             blurOnSubmit={false}
+            editable={status === "open" && !loading}
           />
           <Pressable
-            onPress={exec}
-            style={[styles.runBtn, loading && { opacity: 0.5 }]}
-            disabled={loading}
+            onPress={runCommand}
+            style={[styles.runBtn, (loading || status !== "open") && { opacity: 0.5 }]}
+            disabled={loading || status !== "open"}
             testID="run-btn"
           >
             <Mono color={COLORS.black}>{loading ? "…" : "RUN"}</Mono>
@@ -294,4 +310,3 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
   },
 });
-

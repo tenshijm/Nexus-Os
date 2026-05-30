@@ -1,7 +1,4 @@
-import { Platform } from "react-native";
 import { API_BASE } from "./theme";
-
-const isNative = Platform.OS === "android" || Platform.OS === "ios";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -43,17 +40,4 @@ export const api = {
   network: () => req<any>("/network/scan"),
   logs: (limit = 20) => req<any[]>(`/logs?limit=${limit}`),
   logsClear: () => req<any>("/logs/clear", { method: "POST" }),
-  // Native: GET mirrors the fast telemetry path; POST stalls on Android OkHttp.
-  exec: (command: string) => {
-    const q = encodeURIComponent(command);
-    if (isNative) return req<any>(`/terminal/exec?command=${q}`);
-    return req<any>("/terminal/exec", {
-      method: "POST",
-      body: JSON.stringify({ command }),
-    });
-  },
-  sshTest: () => {
-    if (isNative) return req<any>("/terminal/ssh-test");
-    return req<any>("/terminal/ssh-test", { method: "POST" });
-  },
 };

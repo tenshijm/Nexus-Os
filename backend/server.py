@@ -8,8 +8,9 @@ Real integrations:
 """
 import json
 import threading
+import contextlib
 
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from starlette.responses import Response
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -934,6 +935,83 @@ async def _log(level: str, source: str, message: str):
         old = await db.nexus_logs.find({}, {"_id": 1}).sort("timestamp", 1).limit(count - 500).to_list(length=count)
         if old:
             await db.nexus_logs.delete_many({"_id": {"$in": [o["_id"] for o in old]}})
+
+
+# ----------------------------- Terminal WebSocket -----------------------------
+_WS_PING_INTERVAL_S = 20.0
+
+
+async def _terminal_ws_connected_payload() -> dict:
+    s = await get_settings()
+    use_ssh = bool(s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"))
+    if use_ssh:
+        return {
+            "type": "connected",
+            "source": "ssh",
+            "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
+            "ssh_configured": True,
+        }
+    return {
+        "type": "connected",
+        "source": "sim",
+        "host": "nexus@raspberry-tenshi",
+        "ssh_configured": False,
+    }
+
+
+async def _ws_terminal_ping_loop(websocket: WebSocket) -> None:
+    try:
+        while True:
+            await asyncio.sleep(_WS_PING_INTERVAL_S)
+            await websocket.send_json({"type": "ping"})
+    except Exception:
+        pass
+
+
+@app.websocket("/ws/terminal")
+async def ws_terminal(websocket: WebSocket):
+    """Persistent terminal channel — avoids Android OkHttp POST stalls on LAN."""
+    await websocket.accept()
+    ping_task = asyncio.create_task(_ws_terminal_ping_loop(websocket))
+    try:
+        await websocket.send_json(await _terminal_ws_connected_payload())
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "error": "invalid json"})
+                continue
+
+            mtype = msg.get("type")
+            if mtype == "pong":
+                continue
+            if mtype == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
+            cmd = (msg.get("command") or "").strip()
+            req_id = msg.get("id")
+            if not cmd:
+                continue
+
+            payload = await _terminal_exec_payload(TerminalCommandRequest(command=cmd))
+            await websocket.send_json({
+                "type": "result",
+                "id": req_id,
+                "output": payload.get("output", ""),
+                "exit_code": payload.get("exit_code", 0),
+                "source": payload.get("source"),
+                "host": payload.get("host"),
+                "timing_ms": payload.get("timing_ms"),
+                "command": payload.get("command"),
+            })
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ping_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ping_task
 
 
 # Register router

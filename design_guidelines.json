@@ -1,0 +1,75 @@
+{
+  "theme": "Dark",
+  "archetype": "Archetype 7: Electric & Neon (Sci-Fi Military HUD)",
+  "project_context": {
+    "name": "NEXUS OS",
+    "description": "Tactical military sci-fi home infrastructure control center. Not a normal dashboard, a full operating system mobile UI.",
+    "target_platform": "Expo React Native / Mobile Web App",
+    "navigation_pattern": "Bottom Tab Nav (tactical dock) + Swipeable/Pinchable areas for maps"
+  },
+  "colors": {
+    "nexus-black": "#050505",
+    "nexus-green": "#00FF88",
+    "nexus-cyan": "#00D4FF",
+    "nexus-red": "#FF4444",
+    "nexus-amber": "#FFB800",
+    "nexus-surface": "#0A0F0A",
+    "nexus-card": "#0D1410",
+    "nexus-border": "rgba(0,255,136,0.2)"
+  },
+  "typography": {
+    "headings": {
+      "family": "Orbitron",
+      "usage": "Metrics, Section Titles, Boot Sequence Hero Text",
+      "style": "uppercase, tracking-widest, font-bold"
+    },
+    "terminal_data": {
+      "family": "Share Tech Mono",
+      "usage": "Terminal feeds, data logs, stat numbers, status labels",
+      "style": "uppercase, tracking-tight, glowing text optionally"
+    },
+    "body": {
+      "family": "Inter",
+      "usage": "Standard readability for descriptions, settings details",
+      "style": "normal"
+    }
+  },
+  "effects_and_motion": {
+    "borders": "Thin 1px glowing green borders `border border-nexus-border shadow-[0_0_8px_rgba(0,255,136,0.3)]`",
+    "hover_active": "Subtle green background tint or intensified border glow on press/hover. High-contrast state changes.",
+    "background_overlay": "Scanline overlay across the app/header using a repeating-linear-gradient in CSS.",
+    "animations": [
+      "Blinking cursor on status labels (infinite step-end opacity animation)",
+      "Count-up number animations for CPU/RAM metrics",
+      "Pulsing dot status indicators (`animate-pulse` with `bg-nexus-green` or `bg-nexus-red`)",
+      "Boot sequence typewriter effect on initial load"
+    ],
+    "corners": "Sharp, maximum 2px radius (`rounded-sm` or `rounded-none`). No pill shapes."
+  },
+  "layout_strategy": {
+    "spacing": "Dense tactical grid (gap-2 to gap-4) mimicking a control console. Bento-box style modular areas.",
+    "bottom_tab_bar": "Fixed at the bottom. Represents core missions (Dashboard, Docker, Home, AI, Comms/Map). Must have a solid dark background with top glowing border.",
+    "mobile_first": "Ensure large touch targets (min 44px) despite the dense sci-fi look. Flatten the hierarchy to avoid deep nested menus."
+  },
+  "component_guidelines": {
+    "cards": "Background `bg-nexus-card`, Border 1px `border-nexus-border`, sharp corners `rounded-sm`, dense padding `p-3`.",
+    "buttons": "Action buttons should look like tactical switches. UPPERCASE labels in `Share Tech Mono`. Solid `bg-nexus-green` for primary (with black text), outlined for secondary.",
+    "progress_rings": "Animated circular SVG rings for CPU/RAM. Glow effects on the stroke.",
+    "terminal": "Fullscreen or large modal area. Solid black background. `Share Tech Mono` green text. Blinking cursor.",
+    "network_map": "Pinch-to-zoom area. Force-directed graph style. Central node 'RASPBERRY-TENSHI', pulsing dots, animated dashed connection lines.",
+    "ai_console": "Chat bubbles styled as command transmissions. User (Cyan, right), AI (Dark Green background, left). Typing indicator."
+  },
+  "testing": {
+    "data_testid_rules": "All interactive and key informational elements MUST include a `data-testid` attribute (e.g., `data-testid=\"docker-start-button\"`, `data-testid=\"bottom-tab-dashboard\"`). Use kebab-case and role-based names."
+  },
+  "media": {
+    "image_urls": [
+      {
+        "url": "https://static.prod-images.emergentagent.com/jobs/775bc3da-73b5-4a61-ae56-89bc038f23f9/images/9d2de7e957a2ae7d28a411ec99c9dc1c2c3e4229e06741f8c5b40d2949ec5d10.png",
+        "description": "Dark tactical military sci-fi HUD background overlay, use as absolute background behind the root view with 5-15% opacity to add texture.",
+        "category": "hud_background"
+      }
+    ]
+  },
+  "instructions_to_main_agent": "Ensure the layout is built Mobile-First (optimized for Expo / mobile PWA). Use Phosphor Icons or Lucide for tactical UI glyphs. Setup Tailwind config to include the nexus custom colors, fonts, and neon shadow utilities. Strictly apply the tactical aesthetics, scanlines, and 2px max radiuses. Ensure the bottom tab bar is prominent, highly accessible for thumbs, and overlays mission critical panels gracefully."
+}

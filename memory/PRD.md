@@ -1,4 +1,4 @@
-# NEXUS OS — Product Requirements (v1.1.0)
+# NEXUS OS — Product Requirements (v1.2.0)
 
 ## Vision
 Tactical military sci-fi mobile control center for a Raspberry Pi home server (codename **RASPBERRY-TENSHI**, IP 192.168.12.177). Looks and feels like an operating system, not a normal dashboard.
@@ -12,7 +12,11 @@ Tactical military sci-fi mobile control center for a Raspberry Pi home server (c
   - Docker SDK against `/var/run/docker.sock`
   - Home Assistant REST API via long-lived token (configurable from app)
   - Ollama REST API (`/api/tags`)
+  - **paramiko-based SSH terminal** that runs commands on the Pi (configurable from CONFIG tab)
   - `psutil` for live CPU / RAM / temperature / network telemetry
+
+## Stability fixes (v1.2.0)
+- Android Expo Go no longer hangs on the splash because Google Fonts blocked first paint. The root layout now only awaits icon fonts (with a 4-second safety timeout) and lets Orbitron / Share Tech Mono / Inter load in the background.
 
 ## Visual Identity
 - Color palette: `nexus-black` `#050505`, `nexus-green` `#00FF88`, `nexus-cyan` `#00D4FF`, `nexus-red` `#FF4444`, `nexus-amber` `#FFB800`.
@@ -28,7 +32,7 @@ Tactical military sci-fi mobile control center for a Raspberry Pi home server (c
 6. **Network Map** — SVG topology with central node + 7 satellites, animated dashed lines, node registry, details card.
 7. **Audio Control** — now-playing card with play/pause/skip, volume slider, URL input, 4 presets, TTS section.
 8. **Terminal** — black/green Share Tech Mono shell, suggestions, history prev/next, server-side simulated command execution.
-9. **Settings (CONFIG)** — configure Hostname / Pi IP / HA URL / HA long-lived token (masked, eye-toggle) / Ollama URL. SAVE / RELOAD / LIVE CONNECTIVITY PROBE buttons. Persists in MongoDB (server) + AsyncStorage (device).
+9. **Settings (CONFIG)** — configure Hostname / Pi IP / HA URL / HA long-lived token (masked, eye-toggle) / Ollama URL / **SSH host, port, user, password** (write-only, masked, eye-toggle). SAVE / RELOAD / LIVE CONNECTIVITY PROBE (now 4 indicators including SSH). Persists in MongoDB (server) + AsyncStorage (device).
 
 ## Backend Endpoints
 - `GET /health`, `GET /api/`, `GET /api/nexus/info`
@@ -39,8 +43,9 @@ Tactical military sci-fi mobile control center for a Raspberry Pi home server (c
 - `GET /api/audio/state`, `POST /api/audio/{play|stop|volume|tts}`
 - `GET /api/network/scan` — derived from Docker + HA + central Pi node
 - `GET /api/logs?limit=N`, `POST /api/logs/clear`
-- `POST /api/terminal/exec`
-- `GET /api/settings`, `POST /api/settings`, `GET /api/settings/test`
+- `POST /api/terminal/exec` — auto-routes to **paramiko SSH** when credentials set, else simulated shell; response includes `source: 'ssh'|'sim'`, `host`, `exit_code`.
+- `POST /api/terminal/ssh-test` — explicit SSH connectivity probe
+- `GET /api/settings`, `POST /api/settings`, `GET /api/settings/test` (HA / Ollama / Docker / SSH)
 
-## Deployment Reality
-Running this from a cloud preview container CANNOT reach the user's private network. All Docker/HA/Ollama endpoints DEGRADE GRACEFULLY (return empty arrays / `online:false`) when their targets are unreachable. When deployed on the actual Raspberry Pi (or any host with network access to the Pi), every integration becomes live without code changes.
+## Deployment
+`/app/docker-compose.yml` + `/app/backend/Dockerfile` + `/app/DEPLOY.md` ship a turn-key Pi deploy: `docker compose up -d --build` brings up Mongo + the API on port 8001, mounts `/var/run/docker.sock`, and reads optional env defaults that the CONFIG tab can override at runtime.

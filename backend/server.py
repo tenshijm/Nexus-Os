@@ -557,9 +557,9 @@ async def post_settings_api(update: SettingsUpdate):
 
 @api_router.get("/settings/test")
 async def test_settings():
-    """Quick connectivity probe against the configured HA, Ollama and Docker."""
+    """Quick connectivity probe against the configured HA, Ollama, Docker and SSH."""
     s = await get_settings()
-    result = {"ha": None, "ollama": None, "docker": None}
+    result = {"ha": None, "ollama": None, "docker": None, "ssh": None}
     # HA
     try:
         async with httpx.AsyncClient(timeout=5.0) as cli:
@@ -586,6 +586,15 @@ async def test_settings():
         result["docker"] = {"ok": False, "error": e.detail}
     except Exception as e:
         result["docker"] = {"ok": False, "error": str(e)}
+    # SSH
+    if s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"):
+        try:
+            out, code = await asyncio.to_thread(_ssh_run, s, "echo ok", 6.0)
+            result["ssh"] = {"ok": code == 0, "exit_code": code}
+        except Exception as e:
+            result["ssh"] = {"ok": False, "error": str(e)}
+    else:
+        result["ssh"] = {"ok": False, "error": "not configured"}
     return result
 
 

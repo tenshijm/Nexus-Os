@@ -1,34 +1,60 @@
-"""NEXUS OS Backend - Tactical home infrastructure control center API."""
+"""NEXUS OS Backend - Tactical home infrastructure control center API.
+
+Real integrations:
+- Docker via docker SDK (/var/run/docker.sock)
+- Home Assistant via REST API + long-lived token
+- Ollama via REST API
+- Settings stored in MongoDB, configurable from the SETTINGS tab in the app.
+"""
 from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
-import random
 import time
+import asyncio
+import uuid
 from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import List, Optional
-import uuid
+from typing import List, Optional, Any
 from datetime import datetime, timezone
+
+import httpx
+try:
+    import docker as docker_lib
+    from docker.errors import NotFound, APIError
+except Exception:  # pragma: no cover
+    docker_lib = None
+    NotFound = Exception
+    APIError = Exception
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 
+# Default seed values (overridable via /api/settings)
+DEFAULT_SETTINGS = {
+    "ha_url": os.environ.get("HA_URL", "http://192.168.12.177:8123"),
+    "ha_token": os.environ.get("HA_TOKEN", ""),
+    "ollama_url": os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+    "pi_ip": os.environ.get("PI_IP", "192.168.12.177"),
+    "hostname": os.environ.get("PI_HOSTNAME", "RASPBERRY-TENSHI"),
+}
+
 BOOT_TIME = time.time()
 
-app = FastAPI(title="NEXUS OS API", version="1.0.0")
+app = FastAPI(title="NEXUS OS API", version="1.1.0")
 api_router = APIRouter(prefix="/api")
+
+logger = logging.getLogger("nexus")
 
 
 # ----------------------------- Models -----------------------------
@@ -50,30 +76,10 @@ class NexusInfo(BaseModel):
     uptime: int
 
 
-class DockerContainer(BaseModel):
-    id: str
-    name: str
-    image: str
-    status: str  # running | stopped | restarting
-    cpu: float
-    ram_mb: float
-    uptime: int
-
-
-class HADevice(BaseModel):
-    entity_id: str
-    name: str
-    type: str  # light | sensor | switch | camera | binary_sensor
-    state: str
-    value: Optional[str] = None
-    unit: Optional[str] = None
-    last_updated: str
-
-
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
-    history: Optional[List[dict]] = None
+    model: Optional[str] = None  # ignored — we always route to Claude Sonnet 4.5
 
 
 class ChatResponse(BaseModel):
@@ -87,7 +93,7 @@ class AudioPlayRequest(BaseModel):
 
 
 class AudioVolumeRequest(BaseModel):
-    level: int  # 0-100
+    level: int
 
 
 class AudioTTSRequest(BaseModel):
@@ -95,256 +101,289 @@ class AudioTTSRequest(BaseModel):
     voice: Optional[str] = "default"
 
 
-class LogEntry(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    level: str
-    source: str
-    message: str
-
-
 class TerminalCommandRequest(BaseModel):
     command: str
 
 
-# ----------------------------- Mock State -----------------------------
-MOCK_CONTAINERS = [
-    {"id": "c1", "name": "homeassistant", "image": "homeassistant/home-assistant:latest", "status": "running", "started": time.time() - 86400 * 3},
-    {"id": "c2", "name": "ollama", "image": "ollama/ollama:latest", "status": "running", "started": time.time() - 86400 * 2},
-    {"id": "c3", "name": "tailscale", "image": "tailscale/tailscale:latest", "status": "running", "started": time.time() - 86400 * 7},
-    {"id": "c4", "name": "pihole", "image": "pihole/pihole:latest", "status": "stopped", "started": time.time() - 3600},
-    {"id": "c5", "name": "nexus-api", "image": "nexus/api:1.0", "status": "running", "started": time.time() - 1800},
-    {"id": "c6", "name": "portainer", "image": "portainer/portainer-ce:latest", "status": "running", "started": time.time() - 86400 * 5},
-]
-
-MOCK_HA_DEVICES = []
-
-def _seed_ha_devices():
-    if MOCK_HA_DEVICES:
-        return
-    lights = [
-        ("light.living_room", "Living Room"), ("light.kitchen", "Kitchen"),
-        ("light.bedroom", "Bedroom"), ("light.bathroom", "Bathroom"),
-        ("light.hallway", "Hallway"), ("light.office", "Office"),
-        ("light.garage", "Garage"), ("light.porch", "Porch"),
-    ]
-    for eid, name in lights:
-        MOCK_HA_DEVICES.append({
-            "entity_id": eid, "name": name, "type": "light",
-            "state": random.choice(["on", "off"]),
-            "value": None, "unit": None,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        })
-    sensors = [
-        ("sensor.temp_living", "Temp Living", "21.5", "°C"),
-        ("sensor.temp_outside", "Temp Outside", "14.2", "°C"),
-        ("sensor.humidity_bath", "Humidity Bath", "62", "%"),
-        ("sensor.humidity_bed", "Humidity Bedroom", "48", "%"),
-        ("sensor.power_total", "Power Total", "847", "W"),
-        ("sensor.power_kitchen", "Power Kitchen", "232", "W"),
-        ("sensor.co2_office", "CO2 Office", "612", "ppm"),
-        ("sensor.luminance_living", "Luminance Living", "284", "lx"),
-        ("sensor.pressure_atm", "Atmospheric Pressure", "1013", "hPa"),
-        ("sensor.wind_speed", "Wind Speed", "12.4", "km/h"),
-        ("sensor.rain_24h", "Rain 24h", "2.1", "mm"),
-        ("sensor.uv_index", "UV Index", "3", ""),
-        ("binary_sensor.door_front", "Front Door", "off", None),
-        ("binary_sensor.door_back", "Back Door", "off", None),
-        ("binary_sensor.motion_hallway", "Motion Hallway", "on", None),
-        ("binary_sensor.motion_garage", "Motion Garage", "off", None),
-        ("binary_sensor.window_kitchen", "Window Kitchen", "off", None),
-        ("binary_sensor.smoke_main", "Smoke Detector", "off", None),
-    ]
-    for eid, name, val, unit in sensors:
-        kind = "binary_sensor" if "binary_sensor" in eid else "sensor"
-        MOCK_HA_DEVICES.append({
-            "entity_id": eid, "name": name, "type": kind,
-            "state": val if kind == "binary_sensor" else "active",
-            "value": val if kind == "sensor" else None,
-            "unit": unit,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        })
-    switches = [
-        ("switch.heater", "Heater"), ("switch.fan_office", "Fan Office"),
-        ("switch.coffee", "Coffee Machine"), ("switch.tv_living", "TV Living"),
-        ("switch.printer", "Printer"), ("switch.router", "Router"),
-        ("switch.nas", "NAS"), ("switch.charger_ev", "EV Charger"),
-        ("switch.pump_garden", "Garden Pump"), ("switch.alarm", "Alarm System"),
-        ("switch.gate", "Main Gate"), ("switch.solar_invert", "Solar Inverter"),
-    ]
-    for eid, name in switches:
-        MOCK_HA_DEVICES.append({
-            "entity_id": eid, "name": name, "type": "switch",
-            "state": random.choice(["on", "off"]),
-            "value": None, "unit": None,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        })
-    cameras = [
-        ("camera.front_door", "Front Door Cam"), ("camera.garage", "Garage Cam"),
-        ("camera.backyard", "Backyard Cam"), ("camera.living_room", "Living Room Cam"),
-    ]
-    for eid, name in cameras:
-        MOCK_HA_DEVICES.append({
-            "entity_id": eid, "name": name, "type": "camera",
-            "state": "recording",
-            "value": None, "unit": None,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        })
+class SettingsUpdate(BaseModel):
+    ha_url: Optional[str] = None
+    ha_token: Optional[str] = None
+    ollama_url: Optional[str] = None
+    pi_ip: Optional[str] = None
+    hostname: Optional[str] = None
 
 
-_seed_ha_devices()
-
-AUDIO_STATE = {"playing": False, "track": None, "volume": 50, "position": 0, "duration": 0}
-
-
-# ----------------------------- Routes -----------------------------
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "nexus-os", "timestamp": datetime.now(timezone.utc).isoformat()}
+AUDIO_STATE: dict[str, Any] = {
+    "playing": False,
+    "track": None,
+    "volume": 50,
+    "position": 0,
+    "duration": 0,
+}
 
 
-@api_router.get("/")
-async def root():
-    return {"message": "NEXUS OS API ONLINE", "version": "1.0.0"}
+# ----------------------------- Settings store -----------------------------
+async def get_settings() -> dict:
+    doc = await db.nexus_settings.find_one({"_id": "singleton"}, {"_id": 0})
+    if not doc:
+        return dict(DEFAULT_SETTINGS)
+    merged = {**DEFAULT_SETTINGS, **doc}
+    return merged
 
 
-@api_router.get("/nexus/info", response_model=NexusInfo)
-async def nexus_info():
-    return NexusInfo(
-        hostname="RASPBERRY-TENSHI",
-        ip="192.168.12.177",
-        version="1.0.0",
-        uptime=int(time.time() - BOOT_TIME),
+async def save_settings(update: dict) -> dict:
+    clean = {k: v for k, v in update.items() if v is not None}
+    await db.nexus_settings.update_one(
+        {"_id": "singleton"},
+        {"$set": clean},
+        upsert=True,
     )
+    return await get_settings()
 
 
-@api_router.get("/system", response_model=SystemMetrics)
-async def system_metrics():
-    return SystemMetrics(
-        cpu=round(random.uniform(15, 45), 1),
-        ram_used=round(random.uniform(3.8, 5.2), 2),
-        ram_total=8.0,
-        temp=round(random.uniform(48, 62), 1),
-        net_up=round(random.uniform(50, 400), 1),
-        net_down=round(random.uniform(300, 2200), 1),
-        uptime=int(time.time() - BOOT_TIME),
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
+def public_settings(s: dict) -> dict:
+    """Mask the token when returning to clients."""
+    out = dict(s)
+    tok = out.pop("ha_token", "") or ""
+    out["ha_token_set"] = bool(tok)
+    out["ha_token_masked"] = (f"{tok[:6]}…{tok[-4:]}" if len(tok) > 10 else ("***" if tok else ""))
+    return out
+
+
+# ----------------------------- Docker -----------------------------
+def _docker_client():
+    if docker_lib is None:
+        raise HTTPException(503, "Docker SDK not installed on this host")
+    try:
+        return docker_lib.DockerClient(base_url="unix:///var/run/docker.sock")
+    except Exception as e:
+        raise HTTPException(503, f"Docker daemon unreachable: {e}")
+
+
+def _serialize_container(c) -> dict:
+    try:
+        c.reload()
+    except Exception:
+        pass
+    status = c.status  # running | exited | restarting | created | paused
+    norm_status = {
+        "running": "running",
+        "restarting": "restarting",
+    }.get(status, "stopped")
+    started_at = c.attrs.get("State", {}).get("StartedAt", "")
+    uptime = 0
+    if started_at and norm_status == "running":
+        try:
+            dt = datetime.fromisoformat(started_at.replace("Z", "+00:00").split(".")[0] + "+00:00")
+            uptime = int((datetime.now(timezone.utc) - dt).total_seconds())
+        except Exception:
+            uptime = 0
+    cpu_pct = 0.0
+    ram_mb = 0.0
+    if norm_status == "running":
+        try:
+            stats = c.stats(stream=False)
+            cpu_delta = stats["cpu_stats"]["cpu_usage"]["total_usage"] - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+            sys_delta = stats["cpu_stats"]["system_cpu_usage"] - stats["precpu_stats"]["system_cpu_usage"]
+            ncpus = stats["cpu_stats"].get("online_cpus", 1)
+            if sys_delta > 0:
+                cpu_pct = (cpu_delta / sys_delta) * ncpus * 100.0
+            ram_mb = stats["memory_stats"].get("usage", 0) / (1024 * 1024)
+        except Exception:
+            pass
+    image = (c.image.tags[0] if c.image and c.image.tags else c.attrs.get("Config", {}).get("Image", "unknown"))
+    return {
+        "id": c.short_id,
+        "name": c.name,
+        "image": image,
+        "status": norm_status,
+        "cpu": round(cpu_pct, 1),
+        "ram_mb": round(ram_mb, 1),
+        "uptime": uptime,
+    }
 
 
 @api_router.get("/docker")
 async def docker_list():
-    out = []
-    for c in MOCK_CONTAINERS:
-        uptime = int(time.time() - c["started"]) if c["status"] == "running" else 0
-        out.append({
-            "id": c["id"],
-            "name": c["name"],
-            "image": c["image"],
-            "status": c["status"],
-            "cpu": round(random.uniform(0.2, 12.0), 1) if c["status"] == "running" else 0,
-            "ram_mb": round(random.uniform(40, 380), 1) if c["status"] == "running" else 0,
-            "uptime": uptime,
-        })
-    return out
+    try:
+        cli = _docker_client()
+        containers = await asyncio.to_thread(cli.containers.list, all=True)
+        return [_serialize_container(c) for c in containers]
+    except HTTPException:
+        return []
+    except Exception as e:
+        logger.warning(f"docker list error: {e}")
+        return []
+
+
+def _get_container(cli, cid: str):
+    try:
+        return cli.containers.get(cid)
+    except NotFound:
+        raise HTTPException(404, "Container not found")
 
 
 @api_router.post("/docker/start/{cid}")
 async def docker_start(cid: str):
-    for c in MOCK_CONTAINERS:
-        if c["id"] == cid:
-            c["status"] = "running"
-            c["started"] = time.time()
-            await _log("info", "docker", f"Container {c['name']} started")
-            return {"ok": True, "status": "running"}
-    raise HTTPException(404, "Container not found")
+    cli = _docker_client()
+    c = await asyncio.to_thread(_get_container, cli, cid)
+    await asyncio.to_thread(c.start)
+    await _log("info", "docker", f"Container {c.name} started")
+    return {"ok": True, "status": "running"}
 
 
 @api_router.post("/docker/stop/{cid}")
 async def docker_stop(cid: str):
-    for c in MOCK_CONTAINERS:
-        if c["id"] == cid:
-            c["status"] = "stopped"
-            await _log("warn", "docker", f"Container {c['name']} stopped")
-            return {"ok": True, "status": "stopped"}
-    raise HTTPException(404, "Container not found")
+    cli = _docker_client()
+    c = await asyncio.to_thread(_get_container, cli, cid)
+    await asyncio.to_thread(c.stop)
+    await _log("warn", "docker", f"Container {c.name} stopped")
+    return {"ok": True, "status": "stopped"}
 
 
 @api_router.post("/docker/restart/{cid}")
 async def docker_restart(cid: str):
-    for c in MOCK_CONTAINERS:
-        if c["id"] == cid:
-            c["status"] = "running"
-            c["started"] = time.time()
-            await _log("info", "docker", f"Container {c['name']} restarted")
-            return {"ok": True, "status": "running"}
-    raise HTTPException(404, "Container not found")
+    cli = _docker_client()
+    c = await asyncio.to_thread(_get_container, cli, cid)
+    await asyncio.to_thread(c.restart)
+    await _log("info", "docker", f"Container {c.name} restarted")
+    return {"ok": True, "status": "running"}
 
 
 @api_router.get("/docker/logs/{cid}")
 async def docker_logs(cid: str):
-    target = next((c for c in MOCK_CONTAINERS if c["id"] == cid), None)
-    if not target:
-        raise HTTPException(404, "Container not found")
-    lines = []
-    now = datetime.now(timezone.utc)
-    for i in range(100):
-        ts = now.isoformat()
-        levels = ["INFO", "DEBUG", "INFO", "INFO", "WARN", "INFO"]
-        lvl = random.choice(levels)
-        samples = [
-            f"[{target['name']}] heartbeat OK",
-            f"[{target['name']}] request handled in {random.randint(2, 280)}ms",
-            f"[{target['name']}] connection from 192.168.12.{random.randint(2, 254)}",
-            f"[{target['name']}] cache hit ratio {random.randint(60, 99)}%",
-            f"[{target['name']}] auth token refreshed",
-            f"[{target['name']}] worker pool size = {random.randint(2, 16)}",
-        ]
-        lines.append(f"{ts} {lvl} {random.choice(samples)}")
-    return {"id": cid, "name": target["name"], "lines": lines}
+    cli = _docker_client()
+    c = await asyncio.to_thread(_get_container, cli, cid)
+    raw = await asyncio.to_thread(c.logs, tail=100, timestamps=True)
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    return {"id": cid, "name": c.name, "lines": lines}
+
+
+# ----------------------------- Home Assistant -----------------------------
+async def _ha_headers() -> dict:
+    s = await get_settings()
+    tok = s.get("ha_token") or ""
+    if not tok:
+        raise HTTPException(400, "Home Assistant token not configured")
+    return {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+
+
+def _ha_type(entity_id: str, attributes: dict) -> str:
+    prefix = entity_id.split(".", 1)[0]
+    if prefix in ("light", "switch", "camera", "sensor", "binary_sensor"):
+        return prefix
+    return prefix
+
+
+def _ha_normalize(state: dict) -> dict:
+    eid = state["entity_id"]
+    domain = eid.split(".", 1)[0]
+    attrs = state.get("attributes") or {}
+    name = attrs.get("friendly_name") or eid
+    s = state.get("state", "unknown")
+    last = state.get("last_updated") or state.get("last_changed") or datetime.now(timezone.utc).isoformat()
+    out = {
+        "entity_id": eid,
+        "name": name,
+        "type": domain,
+        "state": s,
+        "value": None,
+        "unit": attrs.get("unit_of_measurement"),
+        "last_updated": last,
+    }
+    if domain == "sensor":
+        out["value"] = s
+        out["state"] = "active"
+    return out
 
 
 @api_router.get("/homeassistant/devices")
 async def ha_devices():
-    counts = {"light": 0, "sensor": 0, "switch": 0, "camera": 0, "binary_sensor": 0}
-    for d in MOCK_HA_DEVICES:
+    s = await get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as cli:
+            r = await cli.get(f"{s['ha_url'].rstrip('/')}/api/states", headers=await _ha_headers())
+            r.raise_for_status()
+            states = r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"HA fetch error: {e}")
+        return {"total": 0, "counts": {}, "devices": [], "online": False, "error": str(e)}
+
+    allowed = {"light", "switch", "sensor", "binary_sensor", "camera"}
+    devices = [_ha_normalize(st) for st in states if st["entity_id"].split(".", 1)[0] in allowed]
+    counts: dict[str, int] = {}
+    for d in devices:
         counts[d["type"]] = counts.get(d["type"], 0) + 1
     return {
-        "total": len(MOCK_HA_DEVICES),
+        "total": len(devices),
         "counts": counts,
-        "devices": MOCK_HA_DEVICES,
+        "devices": devices,
         "online": True,
     }
 
 
 @api_router.post("/homeassistant/toggle/{entity_id}")
 async def ha_toggle(entity_id: str):
-    for d in MOCK_HA_DEVICES:
-        if d["entity_id"] == entity_id:
-            if d["type"] not in ("light", "switch"):
-                raise HTTPException(400, "Entity not toggleable")
-            d["state"] = "off" if d["state"] == "on" else "on"
-            d["last_updated"] = datetime.now(timezone.utc).isoformat()
-            await _log("info", "ha", f"{entity_id} toggled to {d['state']}")
-            return {"ok": True, "state": d["state"]}
-    raise HTTPException(404, "Entity not found")
+    s = await get_settings()
+    domain = entity_id.split(".", 1)[0]
+    if domain not in ("light", "switch"):
+        raise HTTPException(400, "Entity not toggleable")
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as cli:
+            r = await cli.post(
+                f"{s['ha_url'].rstrip('/')}/api/services/{domain}/toggle",
+                headers=await _ha_headers(),
+                json={"entity_id": entity_id},
+            )
+            r.raise_for_status()
+            state_r = await cli.get(
+                f"{s['ha_url'].rstrip('/')}/api/states/{entity_id}",
+                headers=await _ha_headers(),
+            )
+            new_state = state_r.json().get("state", "unknown") if state_r.status_code == 200 else "unknown"
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"HA error: {e}")
+    await _log("info", "ha", f"{entity_id} toggled → {new_state}")
+    return {"ok": True, "state": new_state}
 
 
+# ----------------------------- Ollama -----------------------------
 @api_router.get("/ollama/models")
 async def ollama_models():
-    return {
-        "models": [
-            {"name": "claude-sonnet-4.5", "parameters": "Anthropic", "context": 200000, "active": True},
-            {"name": "claude-haiku-4.5", "parameters": "Anthropic", "context": 200000, "active": False},
-            {"name": "gpt-5.4", "parameters": "OpenAI", "context": 128000, "active": False},
-            {"name": "gemini-3.1-pro", "parameters": "Google", "context": 1000000, "active": False},
-        ]
-    }
+    s = await get_settings()
+    base = s["ollama_url"].rstrip("/")
+    real_models = []
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as cli:
+            r = await cli.get(f"{base}/api/tags")
+            if r.status_code == 200:
+                data = r.json()
+                for m in data.get("models", []):
+                    real_models.append({
+                        "name": m.get("name", "unknown"),
+                        "parameters": m.get("details", {}).get("parameter_size", "Ollama"),
+                        "context": 0,
+                        "active": False,
+                    })
+    except Exception as e:
+        logger.info(f"Ollama unreachable: {e}")
+
+    cloud_models = [
+        {"name": "claude-sonnet-4.5", "parameters": "Anthropic", "context": 200000, "active": True},
+        {"name": "claude-haiku-4.5", "parameters": "Anthropic", "context": 200000, "active": False},
+        {"name": "gpt-5.4", "parameters": "OpenAI", "context": 128000, "active": False},
+        {"name": "gemini-3.1-pro", "parameters": "Google", "context": 1000000, "active": False},
+    ]
+    return {"models": cloud_models + real_models}
 
 
 NEXUS_SYSTEM_PROMPT = (
     "You are NEXUS, the tactical AI core of NEXUS OS — a military sci-fi home infrastructure "
-    "operating system running on a Raspberry Pi codenamed RASPBERRY-TENSHI (192.168.12.177). "
+    "operating system running on a Raspberry Pi codenamed RASPBERRY-TENSHI. "
     "You manage Docker containers, Home Assistant devices, audio output and network monitoring. "
     "Respond concisely in a calm, tactical operator tone. Use UPPERCASE for status keywords like "
     "ONLINE, OFFLINE, NOMINAL, WARNING, CRITICAL. Prefix actionable replies with '> '. "
@@ -356,7 +395,6 @@ NEXUS_SYSTEM_PROMPT = (
 async def ollama_chat(req: ChatRequest):
     if not EMERGENT_LLM_KEY:
         raise HTTPException(500, "EMERGENT_LLM_KEY not configured")
-
     session_id = req.session_id or str(uuid.uuid4())
     try:
         chat = LlmChat(
@@ -364,30 +402,23 @@ async def ollama_chat(req: ChatRequest):
             session_id=session_id,
             system_message=NEXUS_SYSTEM_PROMPT,
         ).with_model("anthropic", "claude-sonnet-4-5-20250929")
-
         reply = await chat.send_message(UserMessage(text=req.message))
     except Exception as e:
         logger.error(f"AI error: {e}")
         raise HTTPException(500, f"AI core error: {e}")
-
     ts = datetime.now(timezone.utc).isoformat()
     await db.chat_messages.insert_one({
-        "id": str(uuid.uuid4()),
-        "session_id": session_id,
-        "role": "user",
-        "content": req.message,
-        "timestamp": ts,
+        "id": str(uuid.uuid4()), "session_id": session_id,
+        "role": "user", "content": req.message, "timestamp": ts,
     })
     await db.chat_messages.insert_one({
-        "id": str(uuid.uuid4()),
-        "session_id": session_id,
-        "role": "assistant",
-        "content": reply,
-        "timestamp": ts,
+        "id": str(uuid.uuid4()), "session_id": session_id,
+        "role": "assistant", "content": reply, "timestamp": ts,
     })
     return ChatResponse(reply=reply, session_id=session_id, timestamp=ts)
 
 
+# ----------------------------- Audio -----------------------------
 @api_router.get("/audio/state")
 async def audio_state():
     return AUDIO_STATE
@@ -398,7 +429,7 @@ async def audio_play(req: AudioPlayRequest):
     AUDIO_STATE["playing"] = True
     AUDIO_STATE["track"] = req.url
     AUDIO_STATE["position"] = 0
-    AUDIO_STATE["duration"] = random.randint(120, 320)
+    AUDIO_STATE["duration"] = 240
     await _log("info", "audio", f"Playing {req.url}")
     return {"ok": True, "state": AUDIO_STATE}
 
@@ -413,9 +444,8 @@ async def audio_stop():
 
 @api_router.post("/audio/volume")
 async def audio_volume(req: AudioVolumeRequest):
-    level = max(0, min(100, req.level))
-    AUDIO_STATE["volume"] = level
-    return {"ok": True, "volume": level}
+    AUDIO_STATE["volume"] = max(0, min(100, req.level))
+    return {"ok": True, "volume": AUDIO_STATE["volume"]}
 
 
 @api_router.post("/audio/tts")
@@ -424,21 +454,199 @@ async def audio_tts(req: AudioTTSRequest):
     return {"ok": True, "spoken": req.text, "voice": req.voice}
 
 
+# ----------------------------- System telemetry -----------------------------
+def _read_psutil_metrics() -> dict:
+    """Pull real metrics from psutil if available; otherwise return zeros."""
+    try:
+        import psutil  # type: ignore
+        cpu = psutil.cpu_percent(interval=0.0)
+        vm = psutil.virtual_memory()
+        ram_used = vm.used / (1024**3)
+        ram_total = vm.total / (1024**3)
+        temp = 0.0
+        try:
+            temps = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
+            for entries in temps.values():
+                if entries:
+                    temp = float(entries[0].current)
+                    break
+        except Exception:
+            pass
+        net = psutil.net_io_counters()
+        return {
+            "cpu": float(cpu),
+            "ram_used": float(ram_used),
+            "ram_total": float(ram_total),
+            "temp": float(temp),
+            "_net_sent": net.bytes_sent,
+            "_net_recv": net.bytes_recv,
+        }
+    except Exception:
+        return {"cpu": 0.0, "ram_used": 0.0, "ram_total": 0.0, "temp": 0.0, "_net_sent": 0, "_net_recv": 0}
+
+
+_LAST_NET = {"sent": 0, "recv": 0, "ts": time.time()}
+
+
+@api_router.get("/system", response_model=SystemMetrics)
+async def system_metrics():
+    m = _read_psutil_metrics()
+    now = time.time()
+    dt = max(0.001, now - _LAST_NET["ts"])
+    up_kbs = max(0, (m["_net_sent"] - _LAST_NET["sent"])) / 1024.0 / dt
+    dn_kbs = max(0, (m["_net_recv"] - _LAST_NET["recv"])) / 1024.0 / dt
+    _LAST_NET["sent"] = m["_net_sent"]
+    _LAST_NET["recv"] = m["_net_recv"]
+    _LAST_NET["ts"] = now
+    return SystemMetrics(
+        cpu=round(m["cpu"], 1),
+        ram_used=round(m["ram_used"], 2),
+        ram_total=round(m["ram_total"], 2) or 8.0,
+        temp=round(m["temp"], 1),
+        net_up=round(up_kbs, 1),
+        net_down=round(dn_kbs, 1),
+        uptime=int(now - BOOT_TIME),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "nexus-os", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@api_router.get("/")
+async def root():
+    return {"message": "NEXUS OS API ONLINE", "version": "1.1.0"}
+
+
+@api_router.get("/nexus/info", response_model=NexusInfo)
+async def nexus_info():
+    s = await get_settings()
+    return NexusInfo(
+        hostname=s.get("hostname", "RASPBERRY-TENSHI"),
+        ip=s.get("pi_ip", "192.168.12.177"),
+        version="1.1.0",
+        uptime=int(time.time() - BOOT_TIME),
+    )
+
+
+# ----------------------------- Settings endpoints -----------------------------
+@api_router.get("/settings")
+async def get_settings_api():
+    s = await get_settings()
+    return public_settings(s)
+
+
+@api_router.post("/settings")
+async def post_settings_api(update: SettingsUpdate):
+    s = await save_settings(update.dict(exclude_unset=True))
+    await _log("info", "settings", "Configuration updated")
+    return public_settings(s)
+
+
+@api_router.get("/settings/test")
+async def test_settings():
+    """Quick connectivity probe against the configured HA, Ollama and Docker."""
+    s = await get_settings()
+    result = {"ha": None, "ollama": None, "docker": None}
+    # HA
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as cli:
+            r = await cli.get(
+                f"{s['ha_url'].rstrip('/')}/api/",
+                headers={"Authorization": f"Bearer {s.get('ha_token','')}"},
+            )
+            result["ha"] = {"ok": r.status_code == 200, "status": r.status_code}
+    except Exception as e:
+        result["ha"] = {"ok": False, "error": str(e)}
+    # Ollama
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as cli:
+            r = await cli.get(f"{s['ollama_url'].rstrip('/')}/api/tags")
+            result["ollama"] = {"ok": r.status_code == 200, "status": r.status_code}
+    except Exception as e:
+        result["ollama"] = {"ok": False, "error": str(e)}
+    # Docker
+    try:
+        cli = _docker_client()
+        info = await asyncio.to_thread(cli.ping)
+        result["docker"] = {"ok": bool(info)}
+    except HTTPException as e:
+        result["docker"] = {"ok": False, "error": e.detail}
+    except Exception as e:
+        result["docker"] = {"ok": False, "error": str(e)}
+    return result
+
+
+# ----------------------------- Network map -----------------------------
 @api_router.get("/network/scan")
 async def network_scan():
-    devices = [
-        {"id": "n1", "label": "RASPBERRY-TENSHI", "ip": "192.168.12.177", "mac": "DC:A6:32:AA:BB:CC", "online": True, "latency": 0, "central": True},
-        {"id": "n2", "label": "Router", "ip": "192.168.12.1", "mac": "00:11:22:33:44:55", "online": True, "latency": 1},
-        {"id": "n3", "label": "Desktop", "ip": "192.168.12.10", "mac": "00:1A:2B:3C:4D:5E", "online": True, "latency": 2},
-        {"id": "n4", "label": "iPhone", "ip": "192.168.12.42", "mac": "F0:18:98:00:11:22", "online": True, "latency": 8},
-        {"id": "n5", "label": "Smart TV", "ip": "192.168.12.55", "mac": "B8:27:EB:11:22:33", "online": True, "latency": 12},
-        {"id": "n6", "label": "Printer", "ip": "192.168.12.88", "mac": "AC:DE:48:00:11:22", "online": False, "latency": 0},
-        {"id": "n7", "label": "NAS", "ip": "192.168.12.99", "mac": "00:50:56:C0:00:08", "online": True, "latency": 3},
-        {"id": "n8", "label": "Camera-Front", "ip": "192.168.12.150", "mac": "A4:DA:32:00:11:22", "online": True, "latency": 15},
-    ]
-    return {"central_id": "n1", "devices": devices, "bandwidth_mbps": round(random.uniform(85, 240), 1)}
+    """Build a network topology from real Docker containers + HA devices, with the
+    configured Pi as the central node."""
+    s = await get_settings()
+    devices: list[dict] = [{
+        "id": "pi",
+        "label": s.get("hostname", "RASPBERRY-TENSHI"),
+        "ip": s.get("pi_ip", "192.168.12.177"),
+        "mac": "",
+        "online": True,
+        "latency": 0,
+        "central": True,
+        "kind": "host",
+    }]
+    bandwidth = 0.0
+    # Docker containers
+    try:
+        cli = _docker_client()
+        containers = await asyncio.to_thread(cli.containers.list, all=False)
+        for c in containers:
+            devices.append({
+                "id": f"docker-{c.short_id}",
+                "label": c.name,
+                "ip": "",
+                "mac": "",
+                "online": c.status == "running",
+                "latency": 0,
+                "central": False,
+                "kind": "container",
+            })
+    except Exception:
+        pass
+    # HA devices (only physical-ish entities: device_tracker / camera / switch hub)
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as cli:
+            r = await cli.get(
+                f"{s['ha_url'].rstrip('/')}/api/states",
+                headers={"Authorization": f"Bearer {s.get('ha_token','')}"},
+            )
+            if r.status_code == 200:
+                for st in r.json():
+                    eid = st["entity_id"]
+                    domain = eid.split(".", 1)[0]
+                    if domain in ("device_tracker", "camera"):
+                        attrs = st.get("attributes") or {}
+                        devices.append({
+                            "id": f"ha-{eid}",
+                            "label": attrs.get("friendly_name") or eid,
+                            "ip": attrs.get("ip") or "",
+                            "mac": attrs.get("mac") or "",
+                            "online": st["state"] in ("home", "recording", "on", "idle"),
+                            "latency": 0,
+                            "central": False,
+                            "kind": "ha",
+                        })
+    except Exception:
+        pass
+
+    return {
+        "central_id": "pi",
+        "devices": devices,
+        "bandwidth_mbps": bandwidth,
+    }
 
 
+# ----------------------------- Logs -----------------------------
 @api_router.get("/logs")
 async def logs_list(limit: int = 20):
     cursor = db.nexus_logs.find({}, {"_id": 0}).sort("timestamp", -1).limit(limit)
@@ -453,6 +661,7 @@ async def logs_clear():
     return {"ok": True}
 
 
+# ----------------------------- Terminal -----------------------------
 @api_router.post("/terminal/exec")
 async def terminal_exec(req: TerminalCommandRequest):
     cmd = (req.command or "").strip()
@@ -500,7 +709,12 @@ def _simulate_shell(cmd: str) -> str:
                 "934   dockerd")
     if head == "docker":
         if len(parts) > 1 and parts[1] == "ps":
-            return "\n".join([f"{c['id']}  {c['name']:<16}  {c['status']:<10}  {c['image']}" for c in MOCK_CONTAINERS])
+            try:
+                cli = _docker_client()
+                cs = cli.containers.list(all=True)
+                return "\n".join([f"{c.short_id}  {c.name:<16}  {c.status:<10}  {(c.image.tags[0] if c.image.tags else '?')}" for c in cs]) or "(no containers)"
+            except Exception as e:
+                return f"docker error: {e}"
         return "Usage: docker ps"
     if head == "ip":
         return "inet 192.168.12.177/24 brd 192.168.12.255 scope global wlan0"
@@ -514,7 +728,7 @@ def _simulate_shell(cmd: str) -> str:
     if head == "neofetch":
         return ("nexus@raspberry-tenshi\n"
                 "----------------------\n"
-                "OS: NEXUS OS 1.0.0\n"
+                "OS: NEXUS OS 1.1.0\n"
                 "Host: Raspberry Pi 5\n"
                 "Kernel: 6.6.20\n"
                 "CPU: BCM2712 (4) @ 2.4GHz\n"
@@ -533,7 +747,6 @@ async def _log(level: str, source: str, message: str):
         "message": message,
     }
     await db.nexus_logs.insert_one(entry.copy())
-    # Trim collection to last 500
     count = await db.nexus_logs.count_documents({})
     if count > 500:
         old = await db.nexus_logs.find({}, {"_id": 1}).sort("timestamp", 1).limit(count - 500).to_list(length=count)
@@ -553,16 +766,21 @@ app.add_middleware(
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("nexus")
 
 
 @app.on_event("startup")
 async def on_startup():
+    # Seed token from request if collection is empty
+    existing = await db.nexus_settings.find_one({"_id": "singleton"})
+    if not existing:
+        await db.nexus_settings.update_one(
+            {"_id": "singleton"},
+            {"$set": DEFAULT_SETTINGS},
+            upsert=True,
+        )
     await _log("info", "system", "NEXUS OS core online")
-    await _log("info", "system", "Docker daemon connected")
-    await _log("info", "system", "Home Assistant bridge ready")
-    await _log("info", "system", "Ollama AI core: ONLINE")
-    await _log("info", "system", "All systems nominal")
+    await _log("info", "system", f"Settings loaded; HA target = {DEFAULT_SETTINGS['ha_url']}")
+    await _log("info", "system", f"Ollama target = {DEFAULT_SETTINGS['ollama_url']}")
 
 
 @app.on_event("shutdown")

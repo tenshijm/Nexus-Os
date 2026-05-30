@@ -114,6 +114,16 @@ export default function TabsLayout() {
             tabBarButtonTestID: "tab-terminal",
           }}
         />
+        <Tabs.Screen
+          name="settings"
+          options={{
+            title: "CONFIG",
+            tabBarIcon: ({ color, focused }) => (
+              <TabBarIcon name="settings-outline" color={color} focused={focused} />
+            ),
+            tabBarButtonTestID: "tab-settings",
+          }}
+        />
       </Tabs>
     </View>
   );

@@ -1,0 +1,43 @@
+{
+  "summary": "Iteration 2 verified the new SETTINGS tab (8th tab) and the switch to REAL integrations. Backend: 12/12 pytest passed against the public preview URL. /api/settings returns ha_url/ollama_url/pi_ip/hostname/ha_token_set/ha_token_masked with the raw ha_token correctly omitted; the seeded token is masked as 'eyJhbG\u2026tZ8E'. POST /api/settings with {ollama_url} updates without touching the token; POST with {ha_token} replaces it and the masked value changes accordingly. /api/settings/test returns 200 with {ha,ollama,docker} keys (all ok=false in this preview as expected). /api/docker returns [] (no 5xx) when /var/run/docker.sock is missing. /api/homeassistant/devices returns 200 with online:false+error when HA unreachable, and 400 when the token is cleared. /api/network/scan returns central_id='pi' with the pi node in devices. /api/system returns real psutil-derived numbers (cpu>=0, ram_used>0, ram_total>0, timestamp present, uptime int). /api/ollama/models still lists claude-sonnet-4.5/gpt-5.4/gemini-3.1-pro even when Ollama is down. /api/ollama/chat returns a real Claude Sonnet 4.5 reply via emergentintegrations. Settings persistence verified (POST hostname → GET reflects). Frontend (mobile 390x844 via Playwright): Boot screen → ENTER NEXUS → /dashboard, all 8 tab testIDs present (tab-dashboard…tab-settings). Tapping tab-settings renders settings-screen with HOST/HOME ASSISTANT/OLLAMA sections; cfg-hostname='RASPBERRY-TENSHI', cfg-pi-ip='192.168.12.177', cfg-ha-url='http://192.168.12.177:8123', cfg-ollama-url='http://localhost:11434'. HA token row shows the masked token + a green SET dot and a REPLACE TOKEN button. Tapping cfg-replace-token reveals cfg-ha-token + cfg-ha-token-show (eye toggle works). Editing cfg-ollama-url and tapping cfg-save displays the [ ALERT ] CONFIG SAVED toast (testID toast); cfg-reload re-fetches and the new value persists. cfg-probe renders the three rows HOME ASSISTANT / OLLAMA / DOCKER SOCKET with red dots and the expected unreachable messages ('HTTP FAIL', '[Errno -2] Name or service not k…', 'Docker daemon unreachable: Error'). Navigating to every other tab (DASH/DOCKER/HOME/AI/NET/AUDIO/TERM) after the SETTINGS work shows no red-screen / runtime errors. No new functional issues. RN-web cosmetic warnings from iteration 1 (textShadow*, shadow*, pointerEvents prop, transform-origin DOM key) still appear and are tracked as cosmetic action items.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "RN Web style prop deprecations", "issue": "Console still shows 'textShadow*' / 'shadow*' deprecation warnings on web. Reference: /app/frontend/src/theme.ts and any Tac components using textShadowColor/textShadowRadius/shadowColor/shadowOpacity. Cosmetic only."},
+      {"component": "pointerEvents prop deprecation", "issue": "'props.pointerEvents is deprecated. Use style.pointerEvents' warning persists. Audit components passing pointerEvents as a prop (likely an overlay/scanline component)."},
+      {"component": "transform-origin DOM property", "issue": "Console error 'Invalid DOM property transform-origin. Did you mean transformOrigin?' on the boot screen. Use camelCase transformOrigin in the affected animated style. Reference: boot/intro screen styling."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration2_settings.py",
+    "/app/test_reports/pytest/iteration2_results.xml"
+  ],
+  "action_items": [
+    "(Cosmetic) Migrate textShadow*/shadow* style props to the consolidated textShadow/boxShadow keys to silence RN Web warnings.",
+    "(Cosmetic) Move pointerEvents from a prop to a style on the offending overlay components.",
+    "(Cosmetic) Rename transform-origin → transformOrigin in animated style objects on the boot/intro screen."
+  ],
+  "critical_code_review_comments": [
+    "server.py correctly degrades when Docker / HA / Ollama are unreachable: /api/docker returns [] (no 5xx), /api/homeassistant/devices returns 200 with online:false+error, and /api/settings/test returns 200 with per-target {ok:false,error}.",
+    "Settings store correctly masks the long-lived token in /api/settings responses (ha_token never returned; ha_token_set + ha_token_masked exposed). Mongo singleton doc '_id: singleton' is used and _id is projected out in get_settings.",
+    "Frontend settings.tsx uses storage cache for instant load, then refreshes from /api/settings; tokenDirty flag correctly omits ha_token from the save body when the user has not touched it, preserving the existing token.",
+    "psutil-backed /api/system returns real numbers in this container (ram_used>0, ram_total>0). Good fallback to zeros if psutil import fails.",
+    "All new interactive elements expose testIDs (cfg-*) — test coverage is excellent."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration2_settings.py (new)",
+    "/app/test_reports/pytest/iteration2_results.xml (new)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "seed_data_creation": "During testing I temporarily cleared and replaced the HA token via /api/settings. The original seeded long-lived token (from backend/.env HA_TOKEN) was restored at the end of the run; final GET /api/settings → ha_token_set=true, masked='eyJhbG…tZ8E'. ollama_url also restored to http://localhost:11434, hostname restored to RASPBERRY-TENSHI.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Iteration-2 backend suite lives at /app/backend/tests/test_iteration2_settings.py; iteration-1 suite (test_nexus_api.py) still passes. Both use EXPO_PUBLIC_BACKEND_URL from frontend/.env. HA / Docker / Ollama are intentionally unreachable in this preview — endpoints must return 200 with degraded payloads, NOT 5xx. The settings collection is a Mongo singleton {_id:'singleton'}; if any future test mutates ha_token, restore it from backend/.env HA_TOKEN via POST /api/settings before exiting.",
+  "rca_of_issue": "N/A — no functional issues found."
+}

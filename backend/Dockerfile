@@ -15,4 +15,4 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8001
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8001", "--timeout-keep-alive", "2", "--no-server-header"]

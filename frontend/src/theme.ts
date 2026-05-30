@@ -47,4 +47,4 @@ export function tempColor(t: number): string {
 }
 
 export const API_BASE =
-  (process.env.EXPO_PUBLIC_BACKEND_URL || "") + "/api";
+  (process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.12.177:8001") + "/api";

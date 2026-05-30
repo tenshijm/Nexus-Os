@@ -6,7 +6,10 @@ Real integrations:
 - Ollama via REST API
 - Settings stored in MongoDB, configurable from the SETTINGS tab in the app.
 """
+import json
+
 from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -681,14 +684,36 @@ async def logs_clear():
 
 
 # ----------------------------- Terminal -----------------------------
-@api_router.post("/terminal/exec")
-async def terminal_exec(req: TerminalCommandRequest):
+# React Native on Android can stall 60–120s on reused keep-alive sockets.
+# Stream the JSON body with Connection: close so the client gets bytes immediately.
+_IMMEDIATE_JSON_HEADERS = {
+    "Connection": "close",
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _immediate_json(payload: dict) -> StreamingResponse:
+    body = json.dumps(payload, ensure_ascii=False)
+
+    async def _stream():
+        yield body
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/json; charset=utf-8",
+        headers=_IMMEDIATE_JSON_HEADERS,
+    )
+
+
+async def _terminal_exec_payload(req: TerminalCommandRequest) -> dict:
     """Run a command. If SSH is configured (ssh_host + ssh_user + ssh_password),
     execute it on the real Pi via paramiko. Otherwise fall back to the simulated
     shell so the UI is always usable."""
     cmd = (req.command or "").strip()
     s = await get_settings()
     use_ssh = bool(s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"))
+    ts = datetime.now(timezone.utc).isoformat()
     if use_ssh and cmd not in ("clear", "help", "?"):
         try:
             out, exit_code = await asyncio.to_thread(_ssh_run, s, cmd)
@@ -698,7 +723,7 @@ async def terminal_exec(req: TerminalCommandRequest):
                 "exit_code": exit_code,
                 "source": "ssh",
                 "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": ts,
             }
         except Exception as e:
             return {
@@ -707,7 +732,7 @@ async def terminal_exec(req: TerminalCommandRequest):
                 "exit_code": -1,
                 "source": "ssh",
                 "host": f"{s.get('ssh_user','?')}@{s.get('ssh_host','?')}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": ts,
             }
     out = _simulate_shell(cmd)
     return {
@@ -716,8 +741,13 @@ async def terminal_exec(req: TerminalCommandRequest):
         "exit_code": 0,
         "source": "sim",
         "host": "nexus@raspberry-tenshi",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": ts,
     }
+
+
+@api_router.post("/terminal/exec")
+async def terminal_exec(req: TerminalCommandRequest):
+    return _immediate_json(await _terminal_exec_payload(req))
 
 
 def _ssh_run(s: dict, cmd: str, timeout: float = 12.0) -> tuple[str, int]:
@@ -750,18 +780,18 @@ def _ssh_run(s: dict, cmd: str, timeout: float = 12.0) -> tuple[str, int]:
 async def terminal_ssh_test():
     s = await get_settings()
     if not (s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password")):
-        return {"ok": False, "configured": False, "error": "ssh credentials not set"}
+        return _immediate_json({"ok": False, "configured": False, "error": "ssh credentials not set"})
     try:
         out, code = await asyncio.to_thread(_ssh_run, s, "echo NEXUS_SSH_OK && hostname && uname -srm", timeout=8.0)
-        return {
+        return _immediate_json({
             "ok": code == 0 and "NEXUS_SSH_OK" in out,
             "configured": True,
             "exit_code": code,
             "output": out,
             "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
-        }
+        })
     except Exception as e:
-        return {"ok": False, "configured": True, "error": str(e)}
+        return _immediate_json({"ok": False, "configured": True, "error": str(e)})
 
 
 def _simulate_shell(cmd: str) -> str:

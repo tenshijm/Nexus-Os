@@ -33,6 +33,7 @@ export default function TerminalScreen() {
   const [history, setHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx] = useState<number>(-1);
   const [source, setSource] = useState<"sim" | "ssh">("sim");
+  const [loading, setLoading] = useState(false);
   const [hostLabel, setHostLabel] = useState<string>("nexus@raspberry-tenshi");
   const scrollRef = useRef<ScrollView>(null);
   const inputRef = useRef<TextInput>(null);
@@ -273,3 +274,4 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
   },
 });
+

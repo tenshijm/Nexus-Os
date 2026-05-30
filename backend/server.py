@@ -7,9 +7,10 @@ Real integrations:
 - Settings stored in MongoDB, configurable from the SETTINGS tab in the app.
 """
 import json
+import threading
 
 from fastapi import FastAPI, APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from starlette.responses import Response
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -684,32 +685,89 @@ async def logs_clear():
 
 
 # ----------------------------- Terminal -----------------------------
-# React Native on Android can stall 60–120s on reused keep-alive sockets.
-# Stream the JSON body with Connection: close so the client gets bytes immediately.
+# React Native on Android can stall on POST + chunked responses. Use a fixed
+# Content-Length body, Connection: close, and offer GET /terminal/exec so
+# mobile clients follow the same fast path as /api/system telemetry.
 _IMMEDIATE_JSON_HEADERS = {
     "Connection": "close",
     "Cache-Control": "no-store, no-cache, must-revalidate",
     "X-Accel-Buffering": "no",
 }
 
+_SSH_POOL_LOCK = threading.Lock()
+_SSH_POOL: dict[tuple, Any] = {}
 
-def _immediate_json(payload: dict) -> StreamingResponse:
-    body = json.dumps(payload, ensure_ascii=False)
 
-    async def _stream():
-        yield body
-
-    return StreamingResponse(
-        _stream(),
+def _immediate_json(payload: dict) -> Response:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return Response(
+        content=body,
         media_type="application/json; charset=utf-8",
-        headers=_IMMEDIATE_JSON_HEADERS,
+        headers={**_IMMEDIATE_JSON_HEADERS, "Content-Length": str(len(body))},
     )
+
+
+def _ssh_pool_key(s: dict) -> tuple:
+    return (
+        s["ssh_host"],
+        int(s.get("ssh_port") or 22),
+        s["ssh_user"],
+        s.get("ssh_password") or "",
+    )
+
+
+def _ssh_connect(s: dict):
+    import paramiko
+
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(
+        hostname=s["ssh_host"],
+        port=int(s.get("ssh_port") or 22),
+        username=s["ssh_user"],
+        password=s.get("ssh_password") or None,
+        timeout=6.0,
+        banner_timeout=6.0,
+        auth_timeout=6.0,
+        look_for_keys=False,
+        allow_agent=False,
+        gss_auth=False,
+        gss_kex=False,
+    )
+    return cli
+
+
+def _ssh_get_client(s: dict):
+    key = _ssh_pool_key(s)
+    cli = _SSH_POOL.get(key)
+    if cli is not None:
+        transport = cli.get_transport()
+        if transport is not None and transport.is_active():
+            return cli, key
+        try:
+            cli.close()
+        except Exception:
+            pass
+        _SSH_POOL.pop(key, None)
+    cli = _ssh_connect(s)
+    _SSH_POOL[key] = cli
+    return cli, key
+
+
+def _ssh_invalidate(key: tuple) -> None:
+    cli = _SSH_POOL.pop(key, None)
+    if cli is not None:
+        try:
+            cli.close()
+        except Exception:
+            pass
 
 
 async def _terminal_exec_payload(req: TerminalCommandRequest) -> dict:
     """Run a command. If SSH is configured (ssh_host + ssh_user + ssh_password),
     execute it on the real Pi via paramiko. Otherwise fall back to the simulated
     shell so the UI is always usable."""
+    t0 = time.monotonic()
     cmd = (req.command or "").strip()
     s = await get_settings()
     use_ssh = bool(s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"))
@@ -724,6 +782,7 @@ async def _terminal_exec_payload(req: TerminalCommandRequest) -> dict:
                 "source": "ssh",
                 "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
                 "timestamp": ts,
+                "timing_ms": round((time.monotonic() - t0) * 1000, 1),
             }
         except Exception as e:
             return {
@@ -733,6 +792,7 @@ async def _terminal_exec_payload(req: TerminalCommandRequest) -> dict:
                 "source": "ssh",
                 "host": f"{s.get('ssh_user','?')}@{s.get('ssh_host','?')}",
                 "timestamp": ts,
+                "timing_ms": round((time.monotonic() - t0) * 1000, 1),
             }
     out = _simulate_shell(cmd)
     return {
@@ -742,40 +802,37 @@ async def _terminal_exec_payload(req: TerminalCommandRequest) -> dict:
         "source": "sim",
         "host": "nexus@raspberry-tenshi",
         "timestamp": ts,
+        "timing_ms": round((time.monotonic() - t0) * 1000, 1),
     }
 
 
+@api_router.get("/terminal/exec")
+async def terminal_exec_get(command: str = ""):
+    return _immediate_json(await _terminal_exec_payload(TerminalCommandRequest(command=command)))
+
+
 @api_router.post("/terminal/exec")
-async def terminal_exec(req: TerminalCommandRequest):
+async def terminal_exec_post(req: TerminalCommandRequest):
     return _immediate_json(await _terminal_exec_payload(req))
 
 
 def _ssh_run(s: dict, cmd: str, timeout: float = 12.0) -> tuple[str, int]:
-    import paramiko
-    cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    cli.connect(
-        hostname=s["ssh_host"],
-        port=int(s.get("ssh_port") or 22),
-        username=s["ssh_user"],
-        password=s.get("ssh_password") or None,
-        timeout=6.0,
-        banner_timeout=6.0,
-        auth_timeout=6.0,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-    try:
-        stdin, stdout, stderr = cli.exec_command(cmd, timeout=timeout, get_pty=False)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        text = (out + (("\n" + err) if err else "")).rstrip()
-        return text or "(no output)", exit_code
-    finally:
-        cli.close()
+    with _SSH_POOL_LOCK:
+        key = _ssh_pool_key(s)
+        try:
+            cli, key = _ssh_get_client(s)
+            stdin, stdout, stderr = cli.exec_command(cmd, timeout=timeout, get_pty=False)
+            out = stdout.read().decode("utf-8", errors="replace")
+            err = stderr.read().decode("utf-8", errors="replace")
+            exit_code = stdout.channel.recv_exit_status()
+            text = (out + (("\n" + err) if err else "")).rstrip()
+            return text or "(no output)", exit_code
+        except Exception:
+            _ssh_invalidate(key)
+            raise
 
 
+@api_router.get("/terminal/ssh-test")
 @api_router.post("/terminal/ssh-test")
 async def terminal_ssh_test():
     s = await get_settings()

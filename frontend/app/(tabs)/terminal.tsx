@@ -60,7 +60,7 @@ export default function TerminalScreen() {
 
   const exec = async () => {
     const cmd = input.trim();
-    if (!cmd) return;
+    if (!cmd || loading) return;
     setLines((l) => [...l, { kind: "in", text: promptText + cmd }]);
     setHistory((h) => [...h, cmd]);
     setHistIdx(-1);
@@ -69,6 +69,8 @@ export default function TerminalScreen() {
       setLines([]);
       return;
     }
+    setLoading(true);
+    const t0 = Date.now();
     try {
       const res = await api.exec(cmd);
       const out = res.output as string;
@@ -78,14 +80,23 @@ export default function TerminalScreen() {
       }
       setSource(res.source || source);
       if (res.host) setHostLabel(res.host);
-      out.split("\n").forEach((line) => {
-        setLines((l) => [...l, { kind: "out", text: line }]);
-      });
+      const outLines: Line[] = out.split("\n").map((text) => ({ kind: "out", text }));
       if (typeof res.exit_code === "number" && res.exit_code !== 0) {
-        setLines((l) => [...l, { kind: "out", text: `[exit ${res.exit_code}]` }]);
+        outLines.push({ kind: "out", text: `[exit ${res.exit_code}]` });
       }
+      const elapsed = Date.now() - t0;
+      const serverMs = typeof res.timing_ms === "number" ? res.timing_ms : null;
+      outLines.push({
+        kind: "out",
+        text: serverMs != null
+          ? `[${elapsed}ms round-trip · ${serverMs}ms server]`
+          : `[${elapsed}ms round-trip]`,
+      });
+      setLines((l) => [...l, ...outLines]);
     } catch {
       setLines((l) => [...l, { kind: "out", text: "error: link down" }]);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -119,7 +130,11 @@ export default function TerminalScreen() {
             ]}
           />
           <Text style={styles.sourceLabel}>
-            {source === "ssh" ? `LIVE SSH · ${hostLabel}` : "SIMULATED SHELL · configure SSH in CONFIG"}
+            {loading
+              ? "EXECUTING…"
+              : source === "ssh"
+                ? `LIVE SSH · ${hostLabel}`
+                : "SIMULATED SHELL · configure SSH in CONFIG"}
           </Text>
         </View>
         <ScrollView
@@ -189,8 +204,13 @@ export default function TerminalScreen() {
             testID="terminal-input"
             blurOnSubmit={false}
           />
-          <Pressable onPress={exec} style={styles.runBtn} testID="run-btn">
-            <Mono color={COLORS.black}>RUN</Mono>
+          <Pressable
+            onPress={exec}
+            style={[styles.runBtn, loading && { opacity: 0.5 }]}
+            disabled={loading}
+            testID="run-btn"
+          >
+            <Mono color={COLORS.black}>{loading ? "…" : "RUN"}</Mono>
           </Pressable>
         </View>
       </View>

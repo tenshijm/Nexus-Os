@@ -5,6 +5,7 @@ import { Card, Heading, Mono, SectionLabel, TacButton, StatusDot } from "@/src/c
 import { ScanlineOverlay } from "@/src/components/ScanlineOverlay";
 import { COLORS, FONTS, API_BASE } from "@/src/theme";
 import { storage } from "@/src/utils/storage";
+import { loadSshCredentials, saveSshCredentials } from "@/src/ssh-credentials";
 
 type Form = {
   ha_url: string;
@@ -69,6 +70,7 @@ export default function SettingsScreen() {
 
   const load = async () => {
     setLoading(true);
+    const localSsh = await loadSshCredentials();
     // Use cached values first for instant UI
     try {
       const cached = await storage.getItem<string>(CACHE_KEY, "");
@@ -85,15 +87,15 @@ export default function SettingsScreen() {
         ollama_url: s.ollama_url || "",
         pi_ip: s.pi_ip || "",
         hostname: s.hostname || "",
-        ssh_host: s.ssh_host || "",
-        ssh_port: String(s.ssh_port ?? 22),
-        ssh_user: s.ssh_user || "",
+        ssh_host: localSsh.host || s.ssh_host || "",
+        ssh_port: localSsh.port || String(s.ssh_port ?? 22),
+        ssh_user: localSsh.username || s.ssh_user || "",
         ssh_password: "",
       });
       setMaskedToken(s.ha_token_masked || "");
       setTokenSet(!!s.ha_token_set);
       setTokenDirty(false);
-      setSshSet(!!s.ssh_password_set);
+      setSshSet(!!localSsh.password);
       setSshDirty(false);
       await storage.setItem(
         CACHE_KEY,
@@ -102,9 +104,19 @@ export default function SettingsScreen() {
           ollama_url: s.ollama_url,
           pi_ip: s.pi_ip,
           hostname: s.hostname,
-        })
+          ssh_host: localSsh.host || s.ssh_host || "",
+          ssh_port: localSsh.port || String(s.ssh_port ?? 22),
+          ssh_user: localSsh.username || s.ssh_user || "",
+        }),
       );
     } catch {
+      setForm((f) => ({
+        ...f,
+        ssh_host: localSsh.host || f.ssh_host,
+        ssh_port: localSsh.port || f.ssh_port,
+        ssh_user: localSsh.username || f.ssh_user,
+      }));
+      setSshSet(!!localSsh.password);
       showToast("[ ALERT ] LOAD FAILED");
     } finally {
       setLoading(false);
@@ -118,7 +130,24 @@ export default function SettingsScreen() {
   const save = async () => {
     setSaving(true);
     try {
-      const body: any = {
+      const existing = await loadSshCredentials();
+      const password =
+        sshDirty && form.ssh_password ? form.ssh_password : existing.password;
+
+      await saveSshCredentials(
+        {
+          host: form.ssh_host,
+          port: form.ssh_port,
+          username: form.ssh_user,
+          password,
+        },
+        { keepPassword: !sshDirty || !form.ssh_password },
+      );
+      setSshSet(!!password);
+      setSshDirty(false);
+      setForm((f) => ({ ...f, ssh_password: "" }));
+
+      const body: Record<string, unknown> = {
         ha_url: form.ha_url.trim(),
         ollama_url: form.ollama_url.trim(),
         pi_ip: form.pi_ip.trim(),
@@ -137,10 +166,13 @@ export default function SettingsScreen() {
           ollama_url: body.ollama_url,
           pi_ip: body.pi_ip,
           hostname: body.hostname,
-        })
+          ssh_host: form.ssh_host.trim(),
+          ssh_port: form.ssh_port || "22",
+          ssh_user: form.ssh_user.trim(),
+        }),
       );
-      showToast("[ ALERT ] CONFIG SAVED");
-    } catch (e: any) {
+      showToast("[ ALERT ] CONFIG SAVED · SSH ON DEVICE");
+    } catch {
       showToast("[ ALERT ] SAVE FAILED");
     } finally {
       setSaving(false);
@@ -297,7 +329,7 @@ export default function SettingsScreen() {
 
           <Card style={{ marginTop: 12 }}>
             <View style={styles.row}>
-              <SectionLabel color={COLORS.red}>SSH SHELL (REAL TERMINAL)</SectionLabel>
+              <SectionLabel color={COLORS.red}>SSH (DEVICE · DIRECT TO PI)</SectionLabel>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
                 <StatusDot color={sshSet ? COLORS.green : COLORS.red} />
                 <Mono size={9} color={COLORS.textMuted}>
@@ -431,7 +463,6 @@ export default function SettingsScreen() {
                 <ProbeRow label="HOME ASSISTANT" result={probe.ha} />
                 <ProbeRow label="OLLAMA" result={probe.ollama} />
                 <ProbeRow label="DOCKER SOCKET" result={probe.docker} />
-                <ProbeRow label="SSH SHELL" result={probe.ssh} />
               </View>
             ) : (
               <Mono color={COLORS.textMuted} size={10} style={{ marginTop: 8 }}>

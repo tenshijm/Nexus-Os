@@ -50,6 +50,3 @@ const BACKEND_ORIGIN =
   process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.12.177:8001";
 
 export const API_BASE = `${BACKEND_ORIGIN}/api`;
-
-/** WebSocket terminal — persistent channel, no OkHttp POST stall on Android LAN. */
-export const WS_TERMINAL_URL = `${BACKEND_ORIGIN.replace(/^https/i, "wss").replace(/^http/i, "ws")}/ws/terminal`;

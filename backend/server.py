@@ -7,11 +7,9 @@ Real integrations:
 - Settings stored in MongoDB, configurable from the SETTINGS tab in the app.
 """
 import json
-import threading
 import contextlib
 
-from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
-from starlette.responses import Response
+from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -52,10 +50,6 @@ DEFAULT_SETTINGS = {
     "ollama_url": os.environ.get("OLLAMA_URL", "http://localhost:11434"),
     "pi_ip": os.environ.get("PI_IP", "192.168.12.177"),
     "hostname": os.environ.get("PI_HOSTNAME", "RASPBERRY-TENSHI"),
-    "ssh_host": os.environ.get("SSH_HOST", "192.168.12.177"),
-    "ssh_port": int(os.environ.get("SSH_PORT", "22")),
-    "ssh_user": os.environ.get("SSH_USER", "nexus"),
-    "ssh_password": os.environ.get("SSH_PASSWORD", ""),
 }
 
 BOOT_TIME = time.time()
@@ -110,20 +104,12 @@ class AudioTTSRequest(BaseModel):
     voice: Optional[str] = "default"
 
 
-class TerminalCommandRequest(BaseModel):
-    command: str
-
-
 class SettingsUpdate(BaseModel):
     ha_url: Optional[str] = None
     ha_token: Optional[str] = None
     ollama_url: Optional[str] = None
     pi_ip: Optional[str] = None
     hostname: Optional[str] = None
-    ssh_host: Optional[str] = None
-    ssh_port: Optional[int] = None
-    ssh_user: Optional[str] = None
-    ssh_password: Optional[str] = None
 
 
 AUDIO_STATE: dict[str, Any] = {
@@ -160,8 +146,6 @@ def public_settings(s: dict) -> dict:
     tok = out.pop("ha_token", "") or ""
     out["ha_token_set"] = bool(tok)
     out["ha_token_masked"] = (f"{tok[:6]}…{tok[-4:]}" if len(tok) > 10 else ("***" if tok else ""))
-    pw = out.pop("ssh_password", "") or ""
-    out["ssh_password_set"] = bool(pw)
     return out
 
 
@@ -562,9 +546,9 @@ async def post_settings_api(update: SettingsUpdate):
 
 @api_router.get("/settings/test")
 async def test_settings():
-    """Quick connectivity probe against the configured HA, Ollama, Docker and SSH."""
+    """Quick connectivity probe against the configured HA, Ollama and Docker."""
     s = await get_settings()
-    result = {"ha": None, "ollama": None, "docker": None, "ssh": None}
+    result = {"ha": None, "ollama": None, "docker": None}
     # HA
     try:
         async with httpx.AsyncClient(timeout=5.0) as cli:
@@ -591,15 +575,6 @@ async def test_settings():
         result["docker"] = {"ok": False, "error": e.detail}
     except Exception as e:
         result["docker"] = {"ok": False, "error": str(e)}
-    # SSH
-    if s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"):
-        try:
-            out, code = await asyncio.to_thread(_ssh_run, s, "echo ok", 6.0)
-            result["ssh"] = {"ok": code == 0, "exit_code": code}
-        except Exception as e:
-            result["ssh"] = {"ok": False, "error": str(e)}
-    else:
-        result["ssh"] = {"ok": False, "error": "not configured"}
     return result
 
 
@@ -685,242 +660,6 @@ async def logs_clear():
     return {"ok": True}
 
 
-# ----------------------------- Terminal -----------------------------
-# React Native on Android can stall on POST + chunked responses. Use a fixed
-# Content-Length body, Connection: close, and offer GET /terminal/exec so
-# mobile clients follow the same fast path as /api/system telemetry.
-_IMMEDIATE_JSON_HEADERS = {
-    "Connection": "close",
-    "Cache-Control": "no-store, no-cache, must-revalidate",
-    "X-Accel-Buffering": "no",
-}
-
-_SSH_POOL_LOCK = threading.Lock()
-_SSH_POOL: dict[tuple, Any] = {}
-
-
-def _immediate_json(payload: dict) -> Response:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    return Response(
-        content=body,
-        media_type="application/json; charset=utf-8",
-        headers={**_IMMEDIATE_JSON_HEADERS, "Content-Length": str(len(body))},
-    )
-
-
-def _ssh_pool_key(s: dict) -> tuple:
-    return (
-        s["ssh_host"],
-        int(s.get("ssh_port") or 22),
-        s["ssh_user"],
-        s.get("ssh_password") or "",
-    )
-
-
-def _ssh_connect(s: dict):
-    import paramiko
-
-    cli = paramiko.SSHClient()
-    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    cli.connect(
-        hostname=s["ssh_host"],
-        port=int(s.get("ssh_port") or 22),
-        username=s["ssh_user"],
-        password=s.get("ssh_password") or None,
-        timeout=6.0,
-        banner_timeout=6.0,
-        auth_timeout=6.0,
-        look_for_keys=False,
-        allow_agent=False,
-        gss_auth=False,
-        gss_kex=False,
-    )
-    return cli
-
-
-def _ssh_get_client(s: dict):
-    key = _ssh_pool_key(s)
-    cli = _SSH_POOL.get(key)
-    if cli is not None:
-        transport = cli.get_transport()
-        if transport is not None and transport.is_active():
-            return cli, key
-        try:
-            cli.close()
-        except Exception:
-            pass
-        _SSH_POOL.pop(key, None)
-    cli = _ssh_connect(s)
-    _SSH_POOL[key] = cli
-    return cli, key
-
-
-def _ssh_invalidate(key: tuple) -> None:
-    cli = _SSH_POOL.pop(key, None)
-    if cli is not None:
-        try:
-            cli.close()
-        except Exception:
-            pass
-
-
-async def _terminal_exec_payload(req: TerminalCommandRequest) -> dict:
-    """Run a command. If SSH is configured (ssh_host + ssh_user + ssh_password),
-    execute it on the real Pi via paramiko. Otherwise fall back to the simulated
-    shell so the UI is always usable."""
-    t0 = time.monotonic()
-    cmd = (req.command or "").strip()
-    s = await get_settings()
-    use_ssh = bool(s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"))
-    ts = datetime.now(timezone.utc).isoformat()
-    if use_ssh and cmd not in ("clear", "help", "?"):
-        try:
-            out, exit_code = await asyncio.to_thread(_ssh_run, s, cmd)
-            return {
-                "command": cmd,
-                "output": out,
-                "exit_code": exit_code,
-                "source": "ssh",
-                "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
-                "timestamp": ts,
-                "timing_ms": round((time.monotonic() - t0) * 1000, 1),
-            }
-        except Exception as e:
-            return {
-                "command": cmd,
-                "output": f"[ssh error] {e}",
-                "exit_code": -1,
-                "source": "ssh",
-                "host": f"{s.get('ssh_user','?')}@{s.get('ssh_host','?')}",
-                "timestamp": ts,
-                "timing_ms": round((time.monotonic() - t0) * 1000, 1),
-            }
-    out = _simulate_shell(cmd)
-    return {
-        "command": cmd,
-        "output": out,
-        "exit_code": 0,
-        "source": "sim",
-        "host": "nexus@raspberry-tenshi",
-        "timestamp": ts,
-        "timing_ms": round((time.monotonic() - t0) * 1000, 1),
-    }
-
-
-@api_router.get("/terminal/exec")
-async def terminal_exec_get(command: str = ""):
-    return _immediate_json(await _terminal_exec_payload(TerminalCommandRequest(command=command)))
-
-
-@api_router.post("/terminal/exec")
-async def terminal_exec_post(req: TerminalCommandRequest):
-    return _immediate_json(await _terminal_exec_payload(req))
-
-
-def _ssh_run(s: dict, cmd: str, timeout: float = 12.0) -> tuple[str, int]:
-    with _SSH_POOL_LOCK:
-        key = _ssh_pool_key(s)
-        try:
-            cli, key = _ssh_get_client(s)
-            stdin, stdout, stderr = cli.exec_command(cmd, timeout=timeout, get_pty=False)
-            out = stdout.read().decode("utf-8", errors="replace")
-            err = stderr.read().decode("utf-8", errors="replace")
-            exit_code = stdout.channel.recv_exit_status()
-            text = (out + (("\n" + err) if err else "")).rstrip()
-            return text or "(no output)", exit_code
-        except Exception:
-            _ssh_invalidate(key)
-            raise
-
-
-@api_router.get("/terminal/ssh-test")
-@api_router.post("/terminal/ssh-test")
-async def terminal_ssh_test():
-    s = await get_settings()
-    if not (s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password")):
-        return _immediate_json({"ok": False, "configured": False, "error": "ssh credentials not set"})
-    try:
-        out, code = await asyncio.to_thread(_ssh_run, s, "echo NEXUS_SSH_OK && hostname && uname -srm", timeout=8.0)
-        return _immediate_json({
-            "ok": code == 0 and "NEXUS_SSH_OK" in out,
-            "configured": True,
-            "exit_code": code,
-            "output": out,
-            "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
-        })
-    except Exception as e:
-        return _immediate_json({"ok": False, "configured": True, "error": str(e)})
-
-
-def _simulate_shell(cmd: str) -> str:
-    if not cmd:
-        return ""
-    parts = cmd.split()
-    head = parts[0].lower()
-    if head in ("help", "?"):
-        return ("Available: help, uptime, whoami, hostname, ls, pwd, date, "
-                "uname, ps, docker, free, df, ip, ping, clear, neofetch")
-    if head == "uptime":
-        secs = int(time.time() - BOOT_TIME)
-        return f"up {secs // 3600}h {(secs % 3600) // 60}m, load average: 0.42 0.35 0.28"
-    if head == "whoami":
-        return "nexus"
-    if head == "hostname":
-        return "raspberry-tenshi"
-    if head == "pwd":
-        return "/home/nexus"
-    if head == "date":
-        return datetime.now(timezone.utc).strftime("%a %b %d %H:%M:%S UTC %Y")
-    if head == "ls":
-        return "Documents  Downloads  containers  nexus-os  logs  scripts"
-    if head == "uname":
-        return "Linux raspberry-tenshi 6.6.20 #1 SMP PREEMPT aarch64 GNU/Linux"
-    if head == "free":
-        return ("              total        used        free\n"
-                "Mem:           8000        4521        3479\n"
-                "Swap:          2048           0        2048")
-    if head == "df":
-        return ("Filesystem     Size  Used Avail Use% Mounted on\n"
-                "/dev/mmcblk0p2 119G   42G   72G  37% /\n"
-                "/dev/sda1      1.8T  632G  1.1T  37% /mnt/data")
-    if head == "ps":
-        return ("PID   CMD\n"
-                "  1   /sbin/init\n"
-                "421   nexus-api\n"
-                "658   ollama serve\n"
-                "812   homeassistant\n"
-                "934   dockerd")
-    if head == "docker":
-        if len(parts) > 1 and parts[1] == "ps":
-            try:
-                cli = _docker_client()
-                cs = cli.containers.list(all=True)
-                return "\n".join([f"{c.short_id}  {c.name:<16}  {c.status:<10}  {(c.image.tags[0] if c.image.tags else '?')}" for c in cs]) or "(no containers)"
-            except Exception as e:
-                return f"docker error: {e}"
-        return "Usage: docker ps"
-    if head == "ip":
-        return "inet 192.168.12.177/24 brd 192.168.12.255 scope global wlan0"
-    if head == "ping":
-        target = parts[1] if len(parts) > 1 else "192.168.12.1"
-        return (f"PING {target} 56 data bytes\n"
-                f"64 bytes from {target}: icmp_seq=1 ttl=64 time=1.42 ms\n"
-                f"64 bytes from {target}: icmp_seq=2 ttl=64 time=1.18 ms\n"
-                f"--- {target} ping statistics ---\n"
-                "2 packets transmitted, 2 received, 0% packet loss")
-    if head == "neofetch":
-        return ("nexus@raspberry-tenshi\n"
-                "----------------------\n"
-                "OS: NEXUS OS 1.1.0\n"
-                "Host: Raspberry Pi 5\n"
-                "Kernel: 6.6.20\n"
-                "CPU: BCM2712 (4) @ 2.4GHz\n"
-                "RAM: 4521MiB / 8000MiB")
-    if head == "clear":
-        return "__CLEAR__"
-    return f"nexus-shell: command not found: {head}"
-
-
 async def _log(level: str, source: str, message: str):
     entry = {
         "id": str(uuid.uuid4()),
@@ -936,82 +675,6 @@ async def _log(level: str, source: str, message: str):
         if old:
             await db.nexus_logs.delete_many({"_id": {"$in": [o["_id"] for o in old]}})
 
-
-# ----------------------------- Terminal WebSocket -----------------------------
-_WS_PING_INTERVAL_S = 20.0
-
-
-async def _terminal_ws_connected_payload() -> dict:
-    s = await get_settings()
-    use_ssh = bool(s.get("ssh_host") and s.get("ssh_user") and s.get("ssh_password"))
-    if use_ssh:
-        return {
-            "type": "connected",
-            "source": "ssh",
-            "host": f"{s['ssh_user']}@{s['ssh_host']}:{s.get('ssh_port', 22)}",
-            "ssh_configured": True,
-        }
-    return {
-        "type": "connected",
-        "source": "sim",
-        "host": "nexus@raspberry-tenshi",
-        "ssh_configured": False,
-    }
-
-
-async def _ws_terminal_ping_loop(websocket: WebSocket) -> None:
-    try:
-        while True:
-            await asyncio.sleep(_WS_PING_INTERVAL_S)
-            await websocket.send_json({"type": "ping"})
-    except Exception:
-        pass
-
-
-@app.websocket("/ws/terminal")
-async def ws_terminal(websocket: WebSocket):
-    """Persistent terminal channel — avoids Android OkHttp POST stalls on LAN."""
-    await websocket.accept()
-    ping_task = asyncio.create_task(_ws_terminal_ping_loop(websocket))
-    try:
-        await websocket.send_json(await _terminal_ws_connected_payload())
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_json({"type": "error", "error": "invalid json"})
-                continue
-
-            mtype = msg.get("type")
-            if mtype == "pong":
-                continue
-            if mtype == "ping":
-                await websocket.send_json({"type": "pong"})
-                continue
-
-            cmd = (msg.get("command") or "").strip()
-            req_id = msg.get("id")
-            if not cmd:
-                continue
-
-            payload = await _terminal_exec_payload(TerminalCommandRequest(command=cmd))
-            await websocket.send_json({
-                "type": "result",
-                "id": req_id,
-                "output": payload.get("output", ""),
-                "exit_code": payload.get("exit_code", 0),
-                "source": payload.get("source"),
-                "host": payload.get("host"),
-                "timing_ms": payload.get("timing_ms"),
-                "command": payload.get("command"),
-            })
-    except WebSocketDisconnect:
-        pass
-    finally:
-        ping_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await ping_task
 
 
 # Register router

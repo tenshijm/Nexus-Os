@@ -1,22 +1,27 @@
 {
   "expo": {
-    "name": "frontend",
-    "slug": "frontend",
+    "name": "NEXUS OS",
+    "slug": "nexus-os",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "frontend",
+    "scheme": "nexus-os",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.nexus.os"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#000"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": ["INTERNET"],
+      "package": "com.nexus.os",
+      "versionCode": 1,
+      "usesCleartextTraffic": true
     },
     "web": {
       "bundler": "metro",

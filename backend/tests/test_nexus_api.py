@@ -163,23 +163,3 @@ def test_logs_list_and_clear(s):
 
     rc = s.post(f"{API}/logs/clear", timeout=20)
     assert rc.status_code == 200 and rc.json()["ok"] is True
-
-
-# ----------------------------- Terminal -----------------------------
-def test_terminal_uptime(s):
-    r = s.post(f"{API}/terminal/exec", json={"command": "uptime"}, timeout=20)
-    assert r.status_code == 200
-    out = r.json()["output"]
-    assert "load average" in out
-
-
-def test_terminal_help(s):
-    r = s.post(f"{API}/terminal/exec", json={"command": "help"}, timeout=20)
-    assert r.status_code == 200
-    assert "uptime" in r.json()["output"]
-
-
-def test_terminal_unknown(s):
-    r = s.post(f"{API}/terminal/exec", json={"command": "foobar123"}, timeout=20)
-    assert r.status_code == 200
-    assert "not found" in r.json()["output"]

@@ -6,12 +6,13 @@
     "preinstall": "./scripts/check-pkg.js",
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint"
   },
   "dependencies": {
+    "@dylankenneally/react-native-ssh-sftp": "^1.7.0",
     "@expo-google-fonts/inter": "^0.4.2",
     "@expo-google-fonts/orbitron": "^0.4.2",
     "@expo-google-fonts/share-tech-mono": "^0.4.1",
